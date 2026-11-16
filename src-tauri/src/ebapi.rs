@@ -574,7 +574,7 @@ impl EbClient {
             run.outcome = Login::Error(call.error.unwrap_or_default());
             return run;
         };
-        let mut cookies = page.cookies;
+        let mut cookies = page.cookies.clone();
         run.notes.push(format!(
             "Inlogpagina: status {}, cookies gezet: {}",
             call.status,
@@ -638,7 +638,14 @@ impl EbClient {
             cookies.retain(|c| c.name != cookie.name);
             cookies.push(cookie);
         }
-        run.outcome = classic_outcome(call.status, &answer.body, &cookies);
+        run.outcome = classic_outcome(call.status, &answer.body, &page.body, &cookies);
+        if !matches!(run.outcome, Login::Session(_)) {
+            let new = new_on_page(&answer.body, &page.body, username);
+            if !new.is_empty() {
+                run.notes
+                    .push(format!("Nieuw op de pagina: {}", new.join(" | ")));
+            }
+        }
         if let Login::Refused(m) | Login::Error(m) = &run.outcome {
             call.error = Some(m.clone());
         }
@@ -1006,8 +1013,10 @@ fn page_title(html: &str) -> Option<String> {
     (!title.is_empty()).then(|| title.chars().take(80).collect())
 }
 
-/// What a page told the user in an `alert(...)`, apart from the form's own "moet ingevuld zijn" checks.
-fn page_alert(html: &str) -> Option<String> {
+/// What the answer to the login form told the user in an `alert(...)`. The login page carries alerts of its
+/// own that say nothing about this sign-in (the form's "moet ingevuld zijn" checks, its bookmark tip): an
+/// alert that `fresh`, the page as it was before the form went out, has too is not the answer's message.
+fn page_alert(html: &str, fresh: &str) -> Option<String> {
     let mut from = 0;
     while let Some(at) = html[from..].find("alert(") {
         let rest = &html[from + at + 6..];
@@ -1016,7 +1025,11 @@ fn page_alert(html: &str) -> Option<String> {
             continue;
         };
         let text = rest[1..].split(quote).next().unwrap_or_default().trim();
-        if !text.is_empty() && !text.contains("moet ingevuld zijn") && !text.contains("doorsturen")
+        if !text.is_empty()
+            && !fresh.contains(text)
+            && !text.contains("moet ingevuld zijn")
+            && !text.contains("doorsturen")
+            && !text.contains("bladwijzers")
         {
             return Some(text.chars().take(200).collect());
         }
@@ -1024,9 +1037,76 @@ fn page_alert(html: &str) -> Option<String> {
     None
 }
 
-/// Reads the answer to the login form. Pure, so it can be tested without e-Boekhouden. The cookies are those
-/// of the login page and of this answer together.
-pub fn classic_outcome(status: u16, body: &str, cookies: &[SetCookie]) -> Login {
+/// The text a page shows, line by line, without its scripts and styles (which may hold values of the session).
+fn shown_lines(html: &str) -> Vec<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut text = String::new();
+    let mut at = 0;
+    while at < html.len() {
+        let hidden = ["<script", "<style"]
+            .iter()
+            .filter_map(|open| lower[at..].find(open).map(|i| (at + i, &open[1..])))
+            .min();
+        let Some((start, tag)) = hidden else {
+            text.push_str(&html[at..]);
+            break;
+        };
+        text.push_str(&html[at..start]);
+        text.push('\n');
+        at = match lower[start..].find(&format!("</{tag}")) {
+            Some(end) => start + end,
+            None => html.len(),
+        };
+        at += lower[at..].find('>').map_or(html.len() - at, |i| i + 1);
+    }
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut in_tag = false;
+    for c in text.chars() {
+        match c {
+            '<' => in_tag = true,
+            // A tag ends the line: what stood in two elements is two texts.
+            '>' => {
+                in_tag = false;
+                line.push('\n');
+            }
+            c if !in_tag => line.push(c),
+            _ => {}
+        }
+    }
+    for part in line.replace("&nbsp;", " ").lines() {
+        let part = part.split_whitespace().collect::<Vec<_>>().join(" ");
+        if part.chars().count() > 3 {
+            lines.push(part);
+        }
+    }
+    lines
+}
+
+/// What the answer to the login form shows that the login page did not: most likely e-Boekhouden's own
+/// words about why it did not sign in. For the diagnosis; `hide` (the username) is left out of it.
+fn new_on_page(answer: &str, fresh: &str, hide: &str) -> Vec<String> {
+    let before = shown_lines(fresh);
+    let mut new: Vec<String> = shown_lines(answer)
+        .into_iter()
+        .filter(|line| !before.contains(line))
+        .map(|line| {
+            let line = if hide.is_empty() {
+                line
+            } else {
+                line.replace(hide, "(gebruikersnaam)")
+            };
+            line.chars().take(160).collect()
+        })
+        .collect();
+    new.dedup();
+    new.truncate(3);
+    new
+}
+
+/// Reads the answer to the login form. Pure, so it can be tested without e-Boekhouden. `fresh` is the login
+/// page as it was before the form went out; the cookies are those of that page and of this answer together.
+pub fn classic_outcome(status: u16, body: &str, fresh: &str, cookies: &[SetCookie]) -> Login {
     if cookies.iter().any(|c| c.name == "auth-token") {
         // What a browser would send on to the API host: the token and the other cookies set for the whole domain.
         return Login::Session(
@@ -1054,7 +1134,7 @@ pub fn classic_outcome(status: u16, body: &str, cookies: &[SetCookie]) -> Login 
         return Login::NeedsCode;
     }
     if asks_password {
-        return Login::Refused(page_alert(body).unwrap_or_else(|| {
+        return Login::Refused(page_alert(body, fresh).unwrap_or_else(|| {
             "e-Boekhouden weigerde de gebruikersnaam of het wachtwoord".into()
         }));
     }
@@ -1669,7 +1749,7 @@ mod tests {
             Some("Inloggen | e-Boekhouden.nl")
         );
         assert_eq!(
-            page_alert(LOGIN_PAGE),
+            page_alert(LOGIN_PAGE, ""),
             None,
             "the form's own checks are no answer"
         );
@@ -1696,6 +1776,36 @@ mod tests {
         );
     }
 
+    /// DGM B.V., 2026-11-16: the answer was the login page again with no message of its own, and the page's
+    /// bookmark tip was read as e-Boekhouden's reason.
+    #[test]
+    fn an_alert_the_login_page_always_has_is_not_the_reason() {
+        let tip = r#"<script>function bookmarkPage(){ if (navigator.userAgent.match('Mac OS X'))
+            alert("Voeg deze pagina eenvoudig toe aan je bladwijzers door Cmd + D in te toetsen.");
+            else alert("Voeg deze pagina eenvoudig toe aan je bladwijzers door CTRL + D in te toetsen."); }</script>"#;
+        let fresh = format!("{LOGIN_PAGE}{tip}");
+        assert_eq!(
+            classic_outcome(200, &fresh, &fresh, &[]),
+            Login::Refused("e-Boekhouden weigerde de gebruikersnaam of het wachtwoord".into())
+        );
+        // Also without the page to compare with, the tip is never the reason.
+        assert_eq!(page_alert(&fresh, ""), None);
+        // A message the answer adds is the reason, wherever it stands among the page's own alerts.
+        let refused = format!(
+            "{LOGIN_PAGE}<script>alert('Dit account is geblokkeerd.')</script>{tip}<div class=x>Je account is tijdelijk geblokkeerd voor jan@studionoord.example</div><script>var t = 'geheim';</script>"
+        );
+        assert_eq!(
+            classic_outcome(200, &refused, &fresh, &[]),
+            Login::Refused("Dit account is geblokkeerd.".into())
+        );
+        // The diagnosis shows what is new on the page, without scripts and without the username.
+        assert_eq!(
+            new_on_page(&refused, &fresh, "jan@studionoord.example"),
+            vec!["Je account is tijdelijk geblokkeerd voor (gebruikersnaam)".to_owned()]
+        );
+        assert!(new_on_page(&fresh, &fresh, "").is_empty());
+    }
+
     #[test]
     fn reads_the_answer_to_the_login_form() {
         let cookie = |name: &str, shared: bool| SetCookie {
@@ -1706,6 +1816,7 @@ mod tests {
         assert_eq!(
             classic_outcome(
                 200,
+                "",
                 "",
                 &[
                     cookie("ASPSESSIONID", false),
@@ -1719,24 +1830,28 @@ mod tests {
             ])
         );
         assert_eq!(
-            classic_outcome(200, LOGIN_PAGE, &[]),
+            classic_outcome(200, LOGIN_PAGE, LOGIN_PAGE, &[]),
             Login::Refused("e-Boekhouden weigerde de gebruikersnaam of het wachtwoord".into())
         );
         assert_eq!(
             classic_outcome(
                 200,
                 "<title>Extra controle</title>Vul de verificatiecode in <input name=\"code\">",
+                LOGIN_PAGE,
                 &[]
             ),
             Login::NeedsCode
         );
-        assert!(matches!(classic_outcome(429, "", &[]), Login::Refused(_)));
+        assert!(matches!(
+            classic_outcome(429, "", "", &[]),
+            Login::Refused(_)
+        ));
         assert_eq!(
-            classic_outcome(500, "<html>stack</html>", &[]),
+            classic_outcome(500, "<html>stack</html>", "", &[]),
             Login::Error("e-Boekhouden gaf een fout bij het inloggen (500)".into())
         );
         assert_eq!(
-            classic_outcome(302, "<title>Object moved</title>", &[]),
+            classic_outcome(302, "<title>Object moved</title>", "", &[]),
             Login::Error(
                 "e-Boekhouden gaf na het inloggen geen token (status 302, pagina: Object moved)"
                     .into()
