@@ -3,12 +3,13 @@
 import { computed, reactive, ref } from 'vue'
 import { addAccount, KINDS, LEVEL_LABELS, presetOf, PRESETS, updateAccount, type AccountView, type Kind, type Level, type OpItem, type Rights, type StoreKind } from '../lib/accounts'
 import { unlockName } from '../lib/server'
+import Avatar from './Avatar.vue'
 import Icon from './Icon.vue'
 import OpItemPicker from './OpItemPicker.vue'
 import Sheet from './Sheet.vue'
 
 const props = defineProps<{ account?: AccountView }>()
-const emit = defineEmits<{ close: []; saved: [AccountView, boolean] }>()
+const emit = defineEmits<{ close: []; saved: [AccountView, boolean]; remove: [AccountView] }>()
 
 const editing = computed(() => !!props.account)
 const form = reactive({
@@ -23,7 +24,23 @@ const form = reactive({
 })
 /** The preset the four levels add up to, if any; set by hand they are an own choice. */
 const preset = computed(() => presetOf(form.rights))
-const rightsHint = computed(() => preset.value?.hint ?? 'Eigen instelling: per soort wijziging hieronder.')
+
+/** Whether the account has a session that stands, has one that expired, or none: the chip in the head. */
+const session = computed(() => {
+  const now = props.account?.session
+  if (!now) return { tone: 'off', text: 'Niet ingelogd' }
+  return now.expired ? { tone: 'bad', text: 'Sessie verlopen' } : { tone: 'on', text: 'Ingelogd' }
+})
+/** What Opslaan does besides saving, in one quiet line next to the buttons. */
+const footNote = computed(() => {
+  if (!props.account) return 'Opslaan logt één keer in om de gegevens te controleren en de administratienaam op te halen.'
+  return session.value.tone === 'on' ? 'Wijzigingen gelden vanaf de volgende keer inloggen; de lopende sessie blijft.' : ''
+})
+const storeHint = computed(() =>
+  form.store === 'onePassword'
+    ? 'EB MCP bewaart alleen een op://-verwijzing en leest het item via de 1Password-CLI, alleen bij het inloggen. 1Password vraagt zelf om toestemming.'
+    : `Gebruikersnaam en wachtwoord in je sleutelhanger, met ${unlockName} bij elk gebruik. EB MCP schrijft het wachtwoord nergens anders weg.`,
+)
 function setLevel(kind: Kind, level: Level) {
   form.rights[kind] = level
 }
@@ -101,88 +118,92 @@ async function save() {
 </script>
 
 <template>
-  <Sheet :title="editing ? `${account!.label} bewerken` : 'Account toevoegen'" :width="560" @close="emit('close')">
+  <Sheet :title="editing ? `${account!.label} bewerken` : 'Account toevoegen'" :width="860" @close="emit('close')">
+    <template #header>
+      <div class="head">
+        <Avatar :label="form.label || 'Nieuw account'" :size="40" :muted="!form.label.trim()" />
+        <span class="head-text">
+          <h2 class="head-title">{{ form.label.trim() || (editing ? account!.label : 'Account toevoegen') }}</h2>
+          <span class="head-sub">{{ editing ? (account!.administration ? `Administratie ${account!.administration}` : 'De administratienaam volgt na de eerste keer inloggen') : 'Nieuw account bij e-Boekhouden' }}</span>
+        </span>
+        <span v-if="editing" class="state" :class="session.tone"><span class="state-dot" aria-hidden="true" />{{ session.text }}</span>
+      </div>
+    </template>
     <form id="account-form" class="form" @submit.prevent="save">
-      <p v-if="editing && account!.session && !account!.session.expired" class="note warn">
-        {{ account!.label }} is ingelogd. Wijzigingen gelden vanaf de volgende keer inloggen; de lopende sessie blijft.
-      </p>
-      <label class="field-block">
-        <span class="label">Naam in EB MCP</span>
-        <input v-model="form.label" class="field" maxlength="60" placeholder="Studio Noord" required />
-      </label>
-      <div v-if="editing" class="field-block">
-        <span class="label">Administratie</span>
-        <input class="field" readonly :value="account!.administration ?? 'Na de eerste keer inloggen'" />
-      </div>
-      <div class="field-block" role="radiogroup" aria-label="Wachtwoord bewaren in">
-        <span class="label">Wachtwoord bewaren in</span>
-        <div class="options">
-          <button type="button" role="radio" :aria-checked="form.store === 'onePassword'" class="option" :class="{ on: form.store === 'onePassword' }" @click="form.store = 'onePassword'">
-            <span class="ring" />
-            <span><strong>1Password</strong><small>EB MCP bewaart alleen een op://-verwijzing. 1Password vraagt zelf om toestemming bij het inloggen.</small></span>
-          </button>
-          <button type="button" role="radio" :aria-checked="form.store === 'system'" class="option" :class="{ on: form.store === 'system' }" @click="form.store = 'system'">
-            <span class="ring" />
-            <span><strong>Sleutelhanger</strong><small>Gebruikersnaam en wachtwoord in je sleutelhanger, met {{ unlockName }} bij elk gebruik.</small></span>
-          </button>
+      <section class="col" aria-label="Inloggen bij e-Boekhouden">
+        <h3 class="col-title">Inloggen bij e-Boekhouden</h3>
+        <label class="field-block">
+          <span class="label">Naam in EB MCP</span>
+          <input v-model="form.label" class="field" maxlength="60" placeholder="Studio Noord" required />
+        </label>
+        <div class="field-block">
+          <span class="label">Wachtwoord staat in</span>
+          <div class="seg" role="radiogroup" aria-label="Wachtwoord bewaren in">
+            <button type="button" role="radio" :aria-checked="form.store === 'onePassword'" :class="{ on: form.store === 'onePassword' }" @click="form.store = 'onePassword'">1Password</button>
+            <button type="button" role="radio" :aria-checked="form.store === 'system'" :class="{ on: form.store === 'system' }" @click="form.store = 'system'">Sleutelhanger</button>
+          </div>
+          <span class="hint">{{ storeHint }}</span>
         </div>
-      </div>
-      <Transition name="accordion" mode="out-in">
-        <div v-if="form.store === 'onePassword'" key="onePassword" class="accordion fields">
-          <div class="fields-inner">
-            <div class="field-block">
-              <span id="op-item-label" class="label">1Password-item</span>
-              <Transition name="swap-op" mode="out-in">
-                <div v-if="opMode === 'card'" key="card" class="op-card" role="group" aria-labelledby="op-item-label">
-                  <span class="op-icon"><Icon name="key" :size="16" /></span>
-                  <span class="op-text">
-                    <span class="op-title" :class="{ mono: !form.opTitle }">{{ form.opTitle ?? form.opRef }}</span>
-                    <span class="op-sub">{{ cardSub }}</span>
-                  </span>
-                  <button type="button" class="btn small" @click="changeItem">Wijzigen</button>
-                </div>
-                <div v-else-if="opMode === 'picker'" key="picker" class="op-picker">
-                  <Transition name="swap-op" mode="out-in">
-                    <OpItemPicker v-if="pickerOpen" :current="form.opRef || null" @pick="pick" @close="closePicker" />
-                    <button v-else type="button" class="btn op-choose" @click="pickerOpen = true"><Icon name="search" :size="15" />Kies uit 1Password…</button>
-                  </Transition>
-                </div>
-                <input
-                  v-else key="manual" v-model="form.opRef" class="field mono" placeholder="op://Werk/e-Boekhouden Studio Noord"
-                  aria-labelledby="op-item-label" spellcheck="false" @input="onManualInput"
-                />
-              </Transition>
-              <span class="op-links">
-                <button v-if="opMode !== 'manual'" type="button" class="link" @click="typeByHand">Verwijzing zelf invullen</button>
-                <button v-else type="button" class="link" @click="changeItem">Kies uit de lijst</button>
-              </span>
-              <span class="hint">EB MCP leest gebruikersnaam en wachtwoord van dit item via de 1Password-CLI, alleen op het moment van inloggen. Het bewaart alleen de verwijzing.</span>
+        <Transition name="accordion" mode="out-in">
+          <div v-if="form.store === 'onePassword'" key="onePassword" class="accordion fields">
+            <div class="fields-inner">
+              <div class="field-block">
+                <span id="op-item-label" class="label">1Password-item</span>
+                <Transition name="swap-op" mode="out-in">
+                  <div v-if="opMode === 'card'" key="card" class="op-card" role="group" aria-labelledby="op-item-label">
+                    <span class="op-icon"><Icon name="key" :size="16" /></span>
+                    <span class="op-text">
+                      <span class="op-title" :class="{ mono: !form.opTitle }" :title="form.opTitle ?? form.opRef">{{ form.opTitle ?? form.opRef }}</span>
+                      <span class="op-sub" :title="cardSub">{{ cardSub }}</span>
+                    </span>
+                    <button type="button" class="btn small" @click="changeItem">Wijzigen</button>
+                  </div>
+                  <div v-else-if="opMode === 'picker'" key="picker" class="op-picker">
+                    <Transition name="swap-op" mode="out-in">
+                      <OpItemPicker v-if="pickerOpen" :current="form.opRef || null" @pick="pick" @close="closePicker" />
+                      <button v-else type="button" class="btn op-choose" @click="pickerOpen = true"><Icon name="search" :size="15" />Kies uit 1Password…</button>
+                    </Transition>
+                  </div>
+                  <input
+                    v-else key="manual" v-model="form.opRef" class="field mono" placeholder="op://Werk/e-Boekhouden Studio Noord"
+                    aria-labelledby="op-item-label" spellcheck="false" @input="onManualInput"
+                  />
+                </Transition>
+                <span class="op-links">
+                  <button v-if="opMode !== 'manual'" type="button" class="link" @click="typeByHand">Verwijzing zelf invullen</button>
+                  <button v-else type="button" class="link" @click="changeItem">Kies uit de lijst</button>
+                </span>
+              </div>
             </div>
           </div>
-        </div>
-        <div v-else key="system" class="accordion fields">
-          <div class="fields-inner">
-            <label class="field-block">
-              <span class="label">Gebruikersnaam of e-mailadres</span>
-              <input v-model="form.username" class="field" autocomplete="off" spellcheck="false" />
-            </label>
-            <label class="field-block">
-              <span class="label">Wachtwoord</span>
-              <span class="with-button">
-                <input v-model="form.password" class="field" :type="showPassword ? 'text' : 'password'" autocomplete="new-password" :placeholder="editing && account!.store === 'system' ? 'Leeg laten om het huidige te houden' : ''" />
-                <button type="button" class="btn small ghost" :aria-pressed="showPassword" @click="showPassword = !showPassword">{{ showPassword ? 'Verbergen' : 'Tonen' }}</button>
-              </span>
-              <span class="hint">Gaat direct de sleutelhanger in. EB MCP schrijft het nergens anders weg.</span>
-            </label>
+          <div v-else key="system" class="accordion fields">
+            <div class="fields-inner">
+              <label class="field-block">
+                <span class="label">Gebruikersnaam of e-mailadres</span>
+                <input v-model="form.username" class="field" autocomplete="off" spellcheck="false" />
+              </label>
+              <label class="field-block">
+                <span class="label">Wachtwoord</span>
+                <span class="with-button">
+                  <input v-model="form.password" class="field" :type="showPassword ? 'text' : 'password'" autocomplete="new-password" :placeholder="editing && account!.store === 'system' ? 'Leeg laten om het huidige te houden' : ''" />
+                  <button type="button" class="btn small ghost" :aria-pressed="showPassword" @click="showPassword = !showPassword">{{ showPassword ? 'Verbergen' : 'Tonen' }}</button>
+                </span>
+              </label>
+            </div>
           </div>
+        </Transition>
+      </section>
+
+      <section class="col" aria-label="Wat AI-clients in dit account mogen">
+        <span class="col-head">
+          <h3 class="col-title">Wat AI-clients in dit account mogen</h3>
+          <Transition name="swap-name" mode="out-in"><span :key="preset?.id ?? 'own'" class="preset-name">{{ preset?.label ?? 'Eigen instelling' }}</span></Transition>
+        </span>
+        <div class="tiles" role="radiogroup" aria-label="AI-clients mogen in dit account">
+          <button v-for="p in PRESETS" :key="p.id" type="button" role="radio" :aria-checked="preset?.id === p.id" class="tile" :class="{ on: preset?.id === p.id }" @click="form.rights = { ...p.rights }">
+            <strong>{{ p.label }}</strong><small>{{ p.hint }}</small>
+          </button>
         </div>
-      </Transition>
-      <div class="field-block">
-        <span class="label">AI-clients mogen in dit account</span>
-        <div class="seg" role="radiogroup" aria-label="AI-clients mogen in dit account">
-          <button v-for="p in PRESETS" :key="p.id" type="button" role="radio" :aria-checked="preset?.id === p.id" :class="{ on: preset?.id === p.id }" @click="form.rights = { ...p.rights }">{{ p.label }}</button>
-        </div>
-        <span class="hint">{{ rightsHint }}</span>
         <div class="rights">
           <div v-for="k in KINDS" :key="k.kind" class="right" :class="{ off: form.rights[k.kind] === 'off' }">
             <span class="right-text">
@@ -201,11 +222,17 @@ async function save() {
             </div>
           </div>
         </Transition>
-      </div>
-      <p v-if="!editing" class="hint">Bij Opslaan logt EB MCP op de achtergrond één keer in, om de gegevens te controleren en de administratienaam op te halen.</p>
-      <p v-if="error" class="note bad rise" role="alert">{{ error }}</p>
+      </section>
+
+      <Transition name="accordion">
+        <div v-if="error" class="accordion wide"><div><p class="note bad" role="alert">{{ error }}</p></div></div>
+      </Transition>
     </form>
     <template #footer>
+      <span class="foot-start">
+        <button v-if="editing" type="button" class="link danger" @click="emit('remove', account!)">Account verwijderen…</button>
+        <span v-if="footNote" class="hint foot-note" :title="footNote">{{ footNote }}</span>
+      </span>
       <button type="button" class="btn" @click="emit('close')">Annuleren</button>
       <button type="submit" form="account-form" class="btn primary" :disabled="busy" :aria-busy="busy"><span class="btn-label">Opslaan</span></button>
     </template>
@@ -213,7 +240,26 @@ async function save() {
 </template>
 
 <style scoped>
-.form { display: flex; flex-direction: column; gap: 14px; }
+.head { flex: none; display: flex; align-items: center; gap: 12px; padding: 18px 20px 14px; }
+.head-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.head-title { font-size: 16px; line-height: 21px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.head-sub { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.state { flex: none; height: 24px; display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; border-radius: 999px; background: var(--subtle); color: var(--muted); font-size: 12px; font-weight: 500; }
+.state-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.state.on { background: var(--success-soft); color: var(--success); }
+.state.bad { background: var(--danger-soft); color: var(--danger); }
+/* Two columns side by side: how EB MCP signs in, and what AI clients may do. In a window too narrow for both
+   (the sheet under 700 px) they stack and the sheet scrolls. */
+.form { container: account-form / inline-size; display: grid; grid-template-columns: minmax(0, 0.8fr) minmax(0, 1fr); align-items: start; border-top: 0.5px solid var(--line); margin-top: -12px; }
+.col { min-width: 0; display: flex; flex-direction: column; gap: 14px; padding: 16px 0 14px; }
+.col:first-child { padding-right: 20px; }
+.col + .col { padding-left: 20px; border-left: 0.5px solid var(--line); align-self: stretch; }
+.wide { grid-column: 1 / -1; }
+.col-head { display: flex; align-items: baseline; gap: 8px; }
+.col-title { font-size: 11px; font-weight: 600; color: var(--muted); }
+.preset-name { margin-left: auto; font-size: 11px; color: var(--muted); }
+.swap-name-enter-active, .swap-name-leave-active { transition: opacity 120ms ease; }
+.swap-name-enter-from, .swap-name-leave-to { opacity: 0; }
 .field-block { display: flex; flex-direction: column; gap: 6px; }
 .label { font-size: 12px; font-weight: 600; color: var(--label); }
 .field {
@@ -221,57 +267,59 @@ async function save() {
   box-shadow: inset 0 0 0 0.5px var(--field); outline: none; transition: box-shadow 150ms ease; -webkit-user-select: text; user-select: text;
 }
 .field:focus { box-shadow: inset 0 0 0 1px var(--accent), 0 0 0 3.5px rgba(10, 132, 255, 0.42); }
-.field[readonly] { background: var(--sunken); color: var(--label); }
 .hint { font-size: 11px; line-height: 15px; color: var(--muted); }
 .seg { align-self: flex-start; display: inline-flex; padding: 2px; border-radius: 999px; background: var(--subtle); }
-.seg button { height: 24px; padding: 0 12px; border: 0; border-radius: 999px; background: transparent; font-size: 12px; transition: background-color 180ms var(--ease), box-shadow 180ms var(--ease); }
+.seg button { height: 24px; padding: 0 12px; border: 0; border-radius: 999px; background: transparent; font-size: 12px; white-space: nowrap; transition: background-color 180ms var(--ease), box-shadow 180ms var(--ease); }
 .seg button:hover { background: var(--hover); }
 .seg button.on { background: var(--seg-on); box-shadow: var(--seg-on-shadow); font-weight: 500; }
 .seg.small { align-self: center; flex: none; }
 .seg.small button { height: 22px; padding: 0 10px; font-size: 11.5px; transition: background-color 180ms var(--ease), box-shadow 180ms var(--ease), color 180ms var(--ease); }
 .seg.small button.free.on { color: var(--danger); }
-.rights { display: flex; flex-direction: column; margin-top: 4px; border-radius: 10px; background: var(--sunken); box-shadow: inset 0 0 0 0.5px var(--field); }
+/* The usual choices as three tiles, each saying what it sets. */
+.tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.tile {
+  display: flex; flex-direction: column; gap: 3px; align-items: flex-start; padding: 10px 11px; border: 0; border-radius: 11px; text-align: left;
+  background: var(--group); box-shadow: inset 0 0 0 0.5px var(--line); transition: box-shadow 150ms ease, background-color 150ms ease;
+}
+.tile:hover { background: var(--hover); }
+.tile.on, .tile.on:hover { background: var(--info-soft); box-shadow: inset 0 0 0 1.5px var(--accent); }
+.tile strong { font-size: 12.5px; font-weight: 600; }
+.tile small { font-size: 11px; line-height: 15px; color: var(--muted); }
+.rights { display: flex; flex-direction: column; border-radius: 11px; background: var(--sunken); box-shadow: inset 0 0 0 0.5px var(--field); }
 .right { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 9px 10px 9px 12px; }
 .right + .right { box-shadow: inset 0 0.5px 0 var(--field); }
 .right-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .right-name { font-size: 12.5px; font-weight: 500; transition: color 180ms var(--ease); }
 .right.off .right-name { color: var(--label); }
-.options { display: flex; gap: 10px; }
-.option {
-  flex: 1; display: flex; gap: 10px; align-items: flex-start; padding: 12px; border: 0; border-radius: 12px; text-align: left;
-  background: var(--group); box-shadow: inset 0 0 0 0.5px var(--line); transition: box-shadow 150ms ease, background-color 150ms ease;
-}
-.option:hover { box-shadow: inset 0 0 0 0.5px var(--field); }
-.option.on { background: var(--info-soft); box-shadow: inset 0 0 0 1.5px var(--accent); }
-.option span { display: flex; flex-direction: column; gap: 4px; }
-.option small { font-size: 11px; line-height: 15px; color: var(--muted); }
-.ring { position: relative; width: 16px; height: 16px; flex: none; box-sizing: border-box; border-radius: 50%; border: 1.5px solid var(--field); background: var(--field-bg); margin-top: 1px; }
-.ring::before, .ring::after { content: ''; position: absolute; border-radius: 50%; opacity: 0; transition: opacity 150ms ease, transform 150ms var(--ease); }
-.ring::before { inset: -1.5px; background: var(--accent); }
-.ring::after { inset: 3.5px; background: #fff; transform: scale(0.4); }
-.option.on .ring::before { opacity: 1; }
-.option.on .ring::after { opacity: 1; transform: none; }
 .fields-inner { display: flex; flex-direction: column; gap: 14px; }
 .fields.accordion-leave-active, .fields.accordion-leave-active > * { transition-duration: 120ms; }
-.op-card { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 12px; background: var(--sunken); box-shadow: inset 0 0 0 0.5px var(--line); }
-.op-icon { width: 32px; height: 32px; flex: none; border-radius: 8px; background: var(--info-soft); color: var(--info); display: flex; align-items: center; justify-content: center; }
-.op-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.op-card { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 11px; background: var(--sunken); box-shadow: inset 0 0 0 0.5px var(--line); }
+.op-icon { width: 30px; height: 30px; flex: none; border-radius: 9px; background: var(--info-soft); color: var(--info); display: flex; align-items: center; justify-content: center; }
+.op-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .op-title, .op-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .op-title { font-size: 13px; font-weight: 600; }
-.op-sub { font-size: 12px; color: var(--muted); }
+.op-sub { font-size: 11px; color: var(--muted); }
 .op-choose { align-self: flex-start; }
 .op-picker { display: flex; flex-direction: column; }
 .op-links { display: flex; }
-.link { padding: 0; border: 0; background: transparent; color: var(--accent); font-size: 12px; transition: opacity 150ms ease; }
-.link:hover { opacity: 0.75; }
+.link { padding: 0; border: 0; background: transparent; color: var(--accent); font-size: 12px; white-space: nowrap; text-decoration: underline; text-decoration-color: transparent; transition: text-decoration-color 150ms ease; }
+.link:hover, .link:focus-visible { text-decoration-color: currentColor; }
+.link.danger { color: var(--danger); }
 .swap-op-enter-active { transition: opacity 180ms var(--ease), transform 180ms var(--ease); }
 .swap-op-leave-active { transition: opacity 120ms cubic-bezier(0.4, 0, 1, 1); }
 .swap-op-enter-from { opacity: 0; transform: translateY(-4px); }
 .swap-op-leave-to { opacity: 0; }
-@media (prefers-reduced-motion: reduce) { .swap-op-enter-from { transform: none; } }
 .with-button { display: flex; gap: 6px; align-items: center; }
 .note { padding: 9px 11px; border-radius: 10px; font-size: 12px; line-height: 16px; }
-.note.warn { background: var(--warn-soft); color: var(--warn); }
 .note.bad { background: var(--danger-soft); color: var(--danger); }
-@media (prefers-reduced-motion: reduce) { .ring::after { transform: none; } }
+.wide .note { margin-bottom: 8px; }
+/* Verwijderen and the quiet line take the left of the foot; the two buttons keep their place on the right. */
+.foot-start { flex: 1; min-width: 0; display: flex; align-items: center; gap: 14px; margin-right: 8px; }
+.foot-note { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@container account-form (max-width: 700px) {
+  .form { grid-template-columns: minmax(0, 1fr); }
+  .col:first-child { padding-right: 0; }
+  .col + .col { padding-left: 0; border-left: 0; border-top: 0.5px solid var(--line); }
+}
+@media (prefers-reduced-motion: reduce) { .swap-op-enter-from { transform: none; } }
 </style>

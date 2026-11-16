@@ -89,7 +89,8 @@ useDialogLayer(panel, () => emit('close'), (el) => el.querySelector<HTMLElement>
 <template>
   <div class="scrim" data-tauri-drag-region>
     <div ref="panel" class="sheet" role="dialog" aria-modal="true" tabindex="-1" :aria-label="props.title" :style="{ width: `${props.width ?? 520}px` }">
-      <h2>{{ props.title }}</h2>
+      <!-- A sheet with a head of its own (an avatar, a status) fills this slot; `title` still names the dialog. -->
+      <slot name="header"><h2>{{ props.title }}</h2></slot>
       <div class="body"><slot /></div>
       <div class="foot"><slot name="footer" /></div>
     </div>
@@ -114,7 +115,7 @@ h2 { flex: none; padding: 18px 20px 0; font-size: 15px; font-weight: 700; }
 .body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 12px 20px 4px; display: flex; flex-direction: column; gap: 14px; }
 /* The body scrolls instead of squeezing its content. */
 .body > :deep(*) { flex-shrink: 0; }
-.foot { flex: none; padding: 16px 20px 18px; display: flex; justify-content: flex-end; gap: 8px; }
+.foot { flex: none; padding: 16px 20px 18px; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 @keyframes drop { from { opacity: 0; transform: translateY(-10px) scale(0.98); } to { opacity: 1; transform: none; } }
 @keyframes lift { to { opacity: 0; transform: translateY(-8px) scale(0.98); } }
 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }

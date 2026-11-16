@@ -230,7 +230,7 @@ function validity(lastUsedAt: number): { sub: string; title: string } {
   </div>
 
   <Transition name="modal"><AccountForm v-if="adding" @close="adding = false" @saved="onSaved" /></Transition>
-  <Transition name="modal"><AccountForm v-if="editing" :account="editing" @close="editing = null" @saved="onSaved" /></Transition>
+  <Transition name="modal"><AccountForm v-if="editing" :account="editing" @close="editing = null" @saved="onSaved" @remove="removing = $event; editing = null" /></Transition>
 
   <Transition name="modal">
     <Sheet v-if="watched" :title="`Inloggen bij ${watched.label}`" :width="440" @close="closeSignin">

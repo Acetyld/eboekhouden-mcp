@@ -847,16 +847,19 @@ describe('the write setting of an account', () => {
     const wrapper = mount(AccountForm, { props: { account }, attachTo: document.body })
     mounted.push(wrapper)
     await flushPromises()
-    const block = document.querySelector('.rights')!.parentElement!
+    const chosen = () => document.querySelector('.preset-name')!.textContent
     const presets = levels('AI-clients mogen in dit account')
-    expect(presets.map((o) => o.textContent)).toEqual(['Alleen lezen', 'Alles met akkoord', 'Vrij boeken'])
+    // Each choice is a tile with its name and what it sets.
+    expect(presets.map((o) => o.querySelector('strong')!.textContent)).toEqual(['Alleen lezen', 'Alles met akkoord', 'Vrij boeken'])
+    expect(presets[0]!.querySelector('small')!.textContent).toContain('niets wijzigen')
+    expect(presets[1]!.querySelector('small')!.textContent).toContain('pas na Goedkeuren')
     expect(presets.map((o) => o.getAttribute('aria-checked'))).toEqual(['true', 'false', 'false'])
-    expect(block.textContent).toContain('niets wijzigen')
+    expect(chosen()).toBe('Alleen lezen')
     expect(['Boeken en wijzigen', 'Verwijderen', 'Versturen', 'Ingrijpend'].map(checked)).toEqual(['Uit', 'Uit', 'Uit', 'Uit'])
     presets[1]!.click()
     await flushPromises()
     expect(presets[1]!.getAttribute('aria-checked')).toBe('true')
-    expect(block.textContent).toContain('pas na Goedkeuren')
+    expect(chosen()).toBe('Alles met akkoord')
     expect(['Boeken en wijzigen', 'Verwijderen', 'Versturen', 'Ingrijpend'].map(checked)).toEqual(['Met akkoord', 'Met akkoord', 'Met akkoord', 'Met akkoord'])
     invoke.mockImplementation(async (command: string) => (command === 'account_update' ? { ...account, rights: ask } : []))
     document.querySelector<HTMLFormElement>('#account-form')!.requestSubmit()
@@ -880,7 +883,7 @@ describe('the write setting of an account', () => {
     levels('Verwijderen')[0]!.click()
     await flushPromises()
     expect(presets.map((o) => o.getAttribute('aria-checked'))).toEqual(['false', 'false', 'false'])
-    expect(document.querySelector('.rights')!.parentElement!.textContent).toContain('Eigen instelling')
+    expect(document.querySelector('.preset-name')!.textContent).toBe('Eigen instelling')
     expect(document.querySelector('.note.bad')).toBeNull()
     // Deleting without approval comes with a warning.
     levels('Verwijderen')[2]!.click()
@@ -892,6 +895,27 @@ describe('the write setting of an account', () => {
     document.querySelector<HTMLFormElement>('#account-form')!.requestSubmit()
     await flushPromises()
     expect(invoke).toHaveBeenCalledWith('account_update', expect.objectContaining({ input: expect.objectContaining({ rights: { change: 'auto', delete: 'off', send: 'ask', heavy: 'ask' } }) }))
+  })
+
+  it('shows who the account is in its head and offers to remove it from the foot', async () => {
+    const signedIn = { ...account, administration: 'Studio Noord B.V.', session: { accountId: 'a1', label: account.label, administration: null, startedAt: 1, lastUsedAt: 1, expired: false } }
+    const wrapper = mount(AccountForm, { props: { account: signedIn }, attachTo: document.body })
+    mounted.push(wrapper)
+    await flushPromises()
+    const dialog = document.querySelector('[role="dialog"]')!
+    expect(dialog.getAttribute('aria-label')).toBe(`${account.label} bewerken`)
+    expect(dialog.querySelector('.head-title')!.textContent).toBe(account.label)
+    expect(dialog.querySelector('.head-sub')!.textContent).toBe('Administratie Studio Noord B.V.')
+    expect(dialog.querySelector('.state')!.textContent).toBe('Ingelogd')
+    // The administration is text, not a field that looks editable; the note about the running session is one quiet line.
+    expect(dialog.querySelector('input[readonly]')).toBeNull()
+    expect(dialog.querySelector('.foot-note')!.textContent).toContain('de lopende sessie blijft')
+    // Where the password is kept is a choice of two, with its fields under it.
+    const stores = levels('Wachtwoord bewaren in')
+    expect(stores.map((o) => o.textContent)).toEqual(['1Password', 'Sleutelhanger'])
+    dialog.querySelector<HTMLButtonElement>('.link.danger')!.click()
+    await flushPromises()
+    expect(wrapper.emitted('remove')![0]).toEqual([signedIn])
   })
 
   it('names the rights on the account in a few words', () => {
