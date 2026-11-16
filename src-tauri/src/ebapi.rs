@@ -1104,6 +1104,25 @@ fn new_on_page(answer: &str, fresh: &str, hide: &str) -> Vec<String> {
     new
 }
 
+/// e-Boekhouden's answer to a sign-in from a place it has not seen this account sign in from (seen 2026-11-16):
+/// the login page again, with a line that it mailed the account's owner a link to confirm. The password was
+/// right; the sign-in works once the owner has followed that link. The address comes masked from the page.
+fn unknown_location(body: &str) -> Option<String> {
+    let said = shown_lines(body)
+        .into_iter()
+        .find(|line| line.contains("locatie die we nog niet kennen"))?;
+    let address = said
+        .split("e-mail op ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .filter(|address| address.contains('@'))
+        .map(|address| format!(" naar {}", address.chars().take(80).collect::<String>()))
+        .unwrap_or_default();
+    Some(format!(
+        "e-Boekhouden kent deze locatie nog niet voor dit account en heeft een e-mail gestuurd{address}. Klik op de link in die mail om te bevestigen en log daarna opnieuw in."
+    ))
+}
+
 /// Reads the answer to the login form. Pure, so it can be tested without e-Boekhouden. `fresh` is the login
 /// page as it was before the form went out; the cookies are those of that page and of this answer together.
 pub fn classic_outcome(status: u16, body: &str, fresh: &str, cookies: &[SetCookie]) -> Login {
@@ -1132,6 +1151,9 @@ pub fn classic_outcome(status: u16, body: &str, fresh: &str, cookies: &[SetCooki
         .any(|n| n.eq_ignore_ascii_case("txtWachtwoord"));
     if !asks_password && TWO_STEP.iter().any(|w| lower.contains(w)) {
         return Login::NeedsCode;
+    }
+    if let Some(message) = unknown_location(body) {
+        return Login::Refused(message);
     }
     if asks_password {
         return Login::Refused(page_alert(body, fresh).unwrap_or_else(|| {
@@ -1804,6 +1826,22 @@ mod tests {
             vec!["Je account is tijdelijk geblokkeerd voor (gebruikersnaam)".to_owned()]
         );
         assert!(new_on_page(&fresh, &fresh, "").is_empty());
+    }
+
+    /// DGM B.V., 2026-11-16: the words e-Boekhouden's page had for a sign-in from a new place.
+    #[test]
+    fn a_sign_in_from_a_new_place_says_that_a_mail_has_to_be_confirmed() {
+        let answer = format!(
+            "{LOGIN_PAGE}<div>Je probeert in te loggen vanaf een locatie die we nog niet kennen. Je ontvangt nu van ons een e-mail op jan*****@stu*****.example om te bevestigen dat jij het bent. </div>"
+        );
+        assert_eq!(
+            classic_outcome(200, &answer, LOGIN_PAGE, &[]),
+            Login::Refused(
+                "e-Boekhouden kent deze locatie nog niet voor dit account en heeft een e-mail gestuurd naar jan*****@stu*****.example. Klik op de link in die mail om te bevestigen en log daarna opnieuw in."
+                    .into()
+            )
+        );
+        assert_eq!(unknown_location(LOGIN_PAGE), None);
     }
 
     #[test]

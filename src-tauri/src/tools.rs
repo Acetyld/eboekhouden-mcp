@@ -2554,6 +2554,21 @@ impl EbMcp {
                 run,
                 format!("De gebruiker heeft het inloggen van {label} gestopt in EB MCP. Probeer het niet opnieuw zonder het te vragen."),
             ),
+            // e-Boekhouden mailed the owner a link (ebapi.rs, `unknown_location`): the user's move, then once more.
+            Some(event)
+                if event
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("kent deze locatie nog niet")) =>
+            {
+                self.fail(
+                    run,
+                    format!(
+                        "{label} is nog niet ingelogd: {} Vraag de gebruiker dat te doen en roep inloggen daarna één keer opnieuw aan.",
+                        event.message.unwrap_or_default()
+                    ),
+                )
+            }
             Some(event) => self.fail(
                 run,
                 format!(
