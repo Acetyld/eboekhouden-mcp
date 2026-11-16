@@ -432,7 +432,7 @@ describe('Alles goedkeuren', () => {
     await mountAt('/akkoord')
     store.accounts = [
       { id: 'a1', label: 'Studio Noord', session: null },
-      { id: 'a2', label: 'Bakkerij Zuid', session: { accountId: 'a2', label: 'Bakkerij Zuid', administration: null, startedAt: 1, expired: false } },
+      { id: 'a2', label: 'Bakkerij Zuid', session: { accountId: 'a2', label: 'Bakkerij Zuid', administration: null, startedAt: 1, lastUsedAt: 1, expired: false } },
     ] as unknown as AccountView[]
     store.loaded = true
     await flushPromises()

@@ -144,7 +144,7 @@ fn start_sign_in(app: &AppHandle, id: Uuid) {
 #[tauri::command]
 async fn op_items(app: AppHandle) -> Result<Vec<creds::OpItem>, creds::OpListError> {
     let items = creds::op_items().await;
-    refocus_main(&app);
+    refocus_after_prompt(&app);
     items
 }
 
@@ -164,6 +164,52 @@ pub(crate) fn refocus_main(app: &AppHandle) {
     {
         let _ = panel.set_focus();
     }
+}
+
+/// Brings EB MCP back after a prompt of 1Password or Touch ID, unless the user has gone on to another app
+/// meanwhile: then the window stays where it is, and whatever they are typing in keeps the focus.
+pub(crate) fn refocus_after_prompt(app: &AppHandle) {
+    if stays_behind(front_app().as_deref()) {
+        return;
+    }
+    refocus_main(app);
+}
+
+/// Whether the app in front is one the user went to on their own: not EB MCP itself, not 1Password and not
+/// one of macOS's own agents that ask for Touch ID or a password. An unknown front app counts as ours.
+fn stays_behind(front: Option<&str>) -> bool {
+    front.is_some_and(|id| {
+        let id = id.to_ascii_lowercase();
+        id != "dev.sherin.ebmcp"
+            && !id.starts_with("com.1password.")
+            && !id.starts_with("com.agilebits.")
+            && id != "com.apple.securityagent"
+            && id != "com.apple.localauthentication.uiagent"
+            && id != "com.apple.coreservices.uiagent"
+    })
+}
+
+/// The bundle identifier of the app that has the keyboard now.
+#[cfg(target_os = "macos")]
+fn front_app() -> Option<String> {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2_foundation::NSString;
+    let class = AnyClass::get(c"NSWorkspace")?;
+    // SAFETY: plain getters of AppKit that return an object or nil, and may be called from any thread.
+    unsafe {
+        let workspace: Option<Retained<AnyObject>> = msg_send![class, sharedWorkspace];
+        let front: Option<Retained<AnyObject>> = msg_send![&*workspace?, frontmostApplication];
+        let id: Option<Retained<NSString>> = msg_send![&*front?, bundleIdentifier];
+        id.map(|id| id.to_string())
+    }
+}
+
+/// Elsewhere the window comes back as before: Windows Hello and 1Password leave EB MCP behind them.
+#[cfg(not(target_os = "macos"))]
+fn front_app() -> Option<String> {
+    None
 }
 
 /// The panel does not hide on focus loss while a sign-in runs (its focus handler in `run`). When the
@@ -676,8 +722,8 @@ fn log_export_reveal(app: AppHandle, path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn stats(app_state: Shared<'_, AppState>) -> reqlog::StatsView {
-    app_state.log.stats()
+fn stats(app_state: Shared<'_, AppState>, since: Option<u64>) -> reqlog::StatsView {
+    app_state.log.stats(since)
 }
 
 /// The full token, only when the user asks to see or copy it.
@@ -1794,6 +1840,21 @@ mod tests {
         }
         // An id the menu does not know (a predefined item) does nothing here.
         assert_eq!(menu_action("copy"), MenuAction::None);
+    }
+
+    #[test]
+    fn the_window_does_not_come_forward_over_an_app_the_user_went_to() {
+        assert!(stays_behind(Some("com.apple.Safari")));
+        assert!(stays_behind(Some("com.anthropic.claudefordesktop")));
+        for ours in [
+            "dev.sherin.ebmcp",
+            "com.1password.1password",
+            "com.apple.SecurityAgent",
+            "com.apple.LocalAuthentication.UIAgent",
+        ] {
+            assert!(!stays_behind(Some(ours)), "{ours}");
+        }
+        assert!(!stays_behind(None));
     }
 
     #[test]

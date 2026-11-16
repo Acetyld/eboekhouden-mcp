@@ -74,6 +74,10 @@ export interface StatsView {
   avgMs: number
   p95Ms: number
   minutes: [number, Minute][]
+  /** Counts per hour (hours since the epoch), oldest first: all that is kept, whatever the period asked for. */
+  hours: [number, Minute][]
+  /** The first hour the counts per hour go back to; a period that starts before it is not complete. */
+  hoursFrom: number | null
   endpoints: EndpointStats[]
   tools: Named[]
   clients: Named[]
@@ -121,13 +125,66 @@ export const entryDetail = (id: number) => invoke<Entry | null>('log_get', { id 
 export const clearLog = () => invoke('log_clear').then(refreshLog)
 /** Writes a debug export of the request log to a file; resolves to its absolute path, rejects with a Dutch sentence. */
 export const exportLog = () => invoke<string>('log_export')
-export const loadStats = () =>
+/** The statistics over everything counted, or with `since` (an hour since the epoch) from that hour on. */
+export const loadStats = (since?: number) =>
   inApp()
-    ? invoke<StatsView>('stats')
+    ? invoke<StatsView>('stats', { since: since ?? null })
     : Promise.resolve<StatsView>({
         startedAt: Date.now(), mcp: 0, eb: 0, errors: 0, bytesIn: 0, bytesOut: 0, avgMs: 0, p95Ms: 0,
-        minutes: [], endpoints: [], tools: [], clients: [], accounts: [], statuses: [],
+        minutes: [], hours: [], hoursFrom: null, endpoints: [], tools: [], clients: [], accounts: [], statuses: [],
       })
+
+export type Period = 'today' | 'week' | 'all'
+export const PERIODS: { id: Period; label: string; words: string }[] = [
+  { id: 'today', label: 'Vandaag', words: 'vandaag' },
+  { id: 'week', label: '7 dagen', words: 'de laatste 7 dagen' },
+  { id: 'all', label: 'Alles', words: 'sinds het begin' },
+]
+
+const HOUR = 3_600_000
+
+/** Midnight at the start of the day `daysAgo` days before `now`, in the user's own time. */
+export function dayStart(now: number, daysAgo = 0): number {
+  const d = new Date(now)
+  d.setHours(0, 0, 0, 0)
+  d.setDate(d.getDate() - daysAgo)
+  return d.getTime()
+}
+
+/** The hour (since the epoch) a period starts at: today's midnight, the midnight six days before it, or none. */
+export function periodSince(period: Period, now = Date.now()): number | undefined {
+  if (period === 'all') return undefined
+  return Math.floor(dayStart(now, period === 'today' ? 0 : 6) / HOUR)
+}
+
+export interface Bar { key: number; label: string; m: Minute }
+
+/** Today's 24 hours, each with its counts; an hour without calls is an empty bar. */
+export function hourBars(hours: [number, Minute][], now = Date.now()): Bar[] {
+  const map = new Map(hours)
+  const first = Math.floor(dayStart(now) / HOUR)
+  return Array.from({ length: 24 }, (_, i) => ({
+    key: first + i,
+    label: `${String(i).padStart(2, '0')}:00 tot ${String(i + 1).padStart(2, '0')}:00`,
+    m: map.get(first + i) ?? { eb: 0, mcp: 0, errors: 0 },
+  }))
+}
+
+/** The last seven days, today last, each the sum of its hours. */
+export function dayBars(hours: [number, Minute][], now = Date.now()): Bar[] {
+  return Array.from({ length: 7 }, (_, i) => {
+    const start = dayStart(now, 6 - i)
+    const end = dayStart(now, 5 - i)
+    const m = { eb: 0, mcp: 0, errors: 0 }
+    for (const [hour, counts] of hours) {
+      if (hour * HOUR < start || hour * HOUR >= end) continue
+      m.eb += counts.eb
+      m.mcp += counts.mcp
+      m.errors += counts.errors
+    }
+    return { key: start, label: new Date(start).toLocaleDateString('nl-NL', { weekday: 'long', day: 'numeric', month: 'long' }), m }
+  })
+}
 
 export function setPaused(paused: boolean): void {
   log.paused = paused

@@ -199,7 +199,7 @@ pub fn export_lines(log: &RequestLog, input: &ExportInput<'_>) -> Result<Vec<Str
     for trace in input.traces {
         lines.push(tagged("signinTrace", trace)?);
     }
-    lines.push(tagged("stats", &log.stats())?);
+    lines.push(tagged("stats", &log.stats(None))?);
     for entry in &entries {
         lines.push(tagged("entry", entry)?);
     }
@@ -405,7 +405,7 @@ mod tests {
         assert!(log.save().unwrap());
         assert!(!log.dirty());
         assert!(!log.save().unwrap(), "nothing changed, nothing written");
-        let before = serde_json::to_value(log.stats()).unwrap();
+        let before = serde_json::to_value(log.stats(None)).unwrap();
 
         let again = RequestLog::default();
         again.open(file.clone());
@@ -423,14 +423,14 @@ mod tests {
         assert_eq!(e.method, "GET");
         assert_eq!(e.version, reqlog::APP_VERSION);
         assert_eq!(e.response, Some(json!({"items": [{"naam": "Bakker"}]})));
-        assert_eq!(serde_json::to_value(again.stats()).unwrap(), before);
+        assert_eq!(serde_json::to_value(again.stats(None)).unwrap(), before);
         // New ids follow the old ones.
         let next = again.start_mcp("Claude", "status", json!({}), None);
         assert!(next > eb);
         // The statistics keep counting from where they were.
         again.finish_mcp(next, Outcome::Ok, None, None);
-        assert_eq!(again.stats().mcp, 2);
-        assert_eq!(again.stats().started_at, log.stats().started_at);
+        assert_eq!(again.stats(None).mcp, 2);
+        assert_eq!(again.stats(None).started_at, log.stats(None).started_at);
     }
 
     #[test]
@@ -472,7 +472,7 @@ mod tests {
         let log = RequestLog::default();
         log.open(file);
         assert_eq!(log.len(), 0);
-        assert_eq!(log.stats().mcp, 0);
+        assert_eq!(log.stats(None).mcp, 0);
     }
 
     #[test]
@@ -511,8 +511,8 @@ mod tests {
         assert_eq!(e.method, "POST");
         let listed = serde_json::to_value(log.list()).unwrap();
         assert_eq!(listed[0]["version"], "");
-        assert_eq!(log.stats().started_at, 1000);
-        assert_eq!(log.stats().mcp, 1);
+        assert_eq!(log.stats(None).started_at, 1000);
+        assert_eq!(log.stats(None).mcp, 1);
         assert!(log.start_mcp("Claude", "status", json!({}), None) >= 3);
     }
 
@@ -534,7 +534,7 @@ mod tests {
         };
         assert_eq!(m.outcome, Outcome::Error);
         assert_eq!(m.error.as_deref(), Some(RESTARTED));
-        let stats = again.stats();
+        let stats = again.stats(None);
         assert_eq!((stats.mcp, stats.errors), (1, 1));
         assert!(again.dirty(), "the error is written back at the next save");
         again.save().unwrap();
@@ -542,7 +542,7 @@ mod tests {
         // Loaded once more, it is not counted twice.
         let third = RequestLog::default();
         third.open(file);
-        assert_eq!((third.stats().mcp, third.stats().errors), (1, 1));
+        assert_eq!((third.stats(None).mcp, third.stats(None).errors), (1, 1));
     }
 
     #[test]
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(m.outcome, Outcome::Refused);
         assert_eq!(m.error.as_deref(), Some(reqlog::LAPSED));
         assert_eq!(m.proposal, Some(3));
-        assert_eq!((again.stats().mcp, again.stats().errors), (1, 1));
+        assert_eq!((again.stats(None).mcp, again.stats(None).errors), (1, 1));
     }
 
     #[test]
@@ -582,7 +582,7 @@ mod tests {
         let again = RequestLog::default();
         again.open(file);
         assert_eq!(again.len(), 0);
-        let stats = again.stats();
+        let stats = again.stats(None);
         assert_eq!((stats.mcp, stats.eb), (1, 1));
     }
 

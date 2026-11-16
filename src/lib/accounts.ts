@@ -11,6 +11,8 @@ export interface SessionView {
   label: string
   administration: string | null
   startedAt: number
+  /** When an AI client last used the session, or when it was signed in; EB MCP forgets it a set time after this. */
+  lastUsedAt: number
   expired: boolean
 }
 

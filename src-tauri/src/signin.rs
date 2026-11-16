@@ -416,7 +416,7 @@ async fn run(
         };
         creds::read(&account, cancel).await
     };
-    crate::refocus_main(app);
+    crate::refocus_after_prompt(app);
     let credentials = match credentials {
         Ok(c) => {
             signins.trace(account_id, "Gegevens gelezen");

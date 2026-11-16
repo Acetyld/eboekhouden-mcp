@@ -56,6 +56,9 @@ pub struct SessionView {
     pub label: String,
     pub administration: Option<String>,
     pub started_at: u64,
+    /// When an AI client last used the session, or when it was signed in: EB MCP forgets it a set time
+    /// after this (Instellingen), which is what the Accounts page counts down to.
+    pub last_used_at: u64,
     pub expired: bool,
 }
 
@@ -144,6 +147,7 @@ impl AppState {
                 label: s.label.clone(),
                 administration: s.administration.clone(),
                 started_at: s.started_at,
+                last_used_at: now_ms().saturating_sub(s.last_used.elapsed().as_millis() as u64),
                 expired: s.expired,
             })
             .collect();

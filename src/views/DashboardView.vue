@@ -1,17 +1,35 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import EmptyState from '../components/EmptyState.vue'
-import { connectLog, duration, loadStats, size, type Minute, type StatsView } from '../lib/log'
+import { PERIODS, connectLog, dayBars, duration, hourBars, loadStats, periodSince, size, type Bar, type Period, type StatsView } from '../lib/log'
 
 const LIMIT_PER_MINUTE = 60
 const stats = ref<StatsView | null>(null)
-const range = ref<15 | 60>(60)
+/** What the tiles and the lists count: today, the last seven days, or everything since the first call. */
+const period = ref<Period>('today')
+/** The chart: the period's hours or days, or the last hour minute by minute against the brake. */
+const live = ref(false)
 const hover = ref<number | null>(null)
+/** Bumped by a load, so the bars that depend on the clock follow it. */
+const loadedAt = ref(Date.now())
+let loadSeq = 0
 let timer: ReturnType<typeof setInterval> | null = null
 let pending: ReturnType<typeof setTimeout> | null = null
 
 async function load() {
-  stats.value = await loadStats()
+  const seq = ++loadSeq
+  const answer = await loadStats(periodSince(period.value))
+  // Only the newest answer counts: one for a period the user has left again must not overwrite it.
+  if (seq !== loadSeq) return
+  stats.value = answer
+  loadedAt.value = Date.now()
+}
+
+function pick(next: Period) {
+  if (period.value === next) return
+  period.value = next
+  hover.value = null
+  void load()
 }
 
 function soon() {
@@ -32,16 +50,35 @@ onBeforeUnmount(() => {
   if (pending) clearTimeout(pending)
 })
 
-/** The last `range` minutes, empty minutes included, oldest first. */
-const minutes = computed<{ at: number; m: Minute }[]>(() => {
-  const now = Math.floor(Date.now() / 60_000)
+/** The last hour minute by minute, empty minutes included, oldest first. */
+const minutes = computed<Bar[]>(() => {
+  const now = Math.floor(loadedAt.value / 60_000)
   const map = new Map(stats.value?.minutes ?? [])
-  return Array.from({ length: range.value }, (_, i) => {
-    const at = now - range.value + 1 + i
-    return { at, m: map.get(at) ?? { eb: 0, mcp: 0, errors: 0 } }
+  return Array.from({ length: 60 }, (_, i) => {
+    const at = now - 59 + i
+    return { key: at, label: clock(at), m: map.get(at) ?? { eb: 0, mcp: 0, errors: 0 } }
   })
 })
-const top = computed(() => Math.max(LIMIT_PER_MINUTE + 4, ...minutes.value.map((x) => x.m.eb + x.m.mcp + x.m.errors)))
+/** What the chart draws: the last hour, today's hours, or the last seven days. */
+const bars = computed<Bar[]>(() => {
+  if (live.value) return minutes.value
+  return period.value === 'today' ? hourBars(stats.value?.hours ?? [], loadedAt.value) : dayBars(stats.value?.hours ?? [], loadedAt.value)
+})
+const chartTitle = computed(() => (live.value ? 'Aanroepen per minuut' : period.value === 'today' ? 'Aanroepen per uur' : 'Aanroepen per dag'))
+const peak = computed(() => Math.max(...bars.value.map((x) => x.m.eb + x.m.mcp + x.m.errors)))
+/** The top of the chart: above the brake for minutes, a round number above the busiest bar otherwise. */
+const top = computed(() => {
+  if (live.value) return Math.max(LIMIT_PER_MINUTE + 4, peak.value)
+  const step = 10 ** Math.max(0, Math.floor(Math.log10(Math.max(peak.value, 4))))
+  return Math.max(4, Math.ceil((peak.value * 1.05) / step) * step)
+})
+/** Four lines across the chart, at round numbers. */
+const gridLines = computed(() => (live.value ? [0, 20, 40, 60] : [0, 1, 2, 3, 4].map((i) => Math.round((top.value / 4) * i)).filter((v, i, all) => all.indexOf(v) === i)))
+const axis = computed(() => {
+  if (live.value) return [minutes.value[0]!.label, 'nu']
+  if (period.value === 'today') return ['00:00', '06:00', '12:00', '18:00', '24:00']
+  return bars.value.map((x) => new Date(x.key).toLocaleDateString('nl-NL', { weekday: 'short', day: 'numeric' }))
+})
 const current = computed(() => minutes.value.at(-1)?.m ?? { eb: 0, mcp: 0, errors: 0 })
 const spark = computed(() => {
   const pts = minutes.value.slice(-30).map((x) => x.m.eb + x.m.mcp)
@@ -52,14 +89,23 @@ const total = computed(() => (stats.value ? stats.value.mcp + stats.value.eb : 0
 const errorRate = computed(() => (total.value ? (stats.value!.errors / total.value) * 100 : 0))
 const recentErrors = computed(() => minutes.value.slice(-10).reduce((n, x) => n + x.m.errors, 0))
 const p95Scale = computed(() => Math.max(1000, ...(stats.value?.endpoints ?? []).map((e) => e.p95Ms)))
-const hovered = computed(() => (hover.value === null ? null : minutes.value[hover.value] ?? null))
+const hovered = computed(() => (hover.value === null ? null : bars.value[hover.value] ?? null))
+const words = computed(() => PERIODS.find((p) => p.id === period.value)!.words)
+/** Counting per hour began with 0.6.4: a period that starts before the first counted hour misses what came before. */
+const incomplete = computed(() => {
+  const since = periodSince(period.value, loadedAt.value)
+  const s = stats.value
+  if (since === undefined || !s || s.startedAt >= since * 3_600_000) return null
+  if (s.hoursFrom !== null && s.hoursFrom <= since) return null
+  return s.hoursFrom === null ? 'Per periode telt EB MCP vanaf deze versie; wat eerder was staat alleen onder Alles.' : `Per periode geteld vanaf ${since_(s.hoursFrom * 3_600_000)}; wat eerder was staat alleen onder Alles.`
+})
 const failing = computed(() => (stats.value?.endpoints ?? []).find((e) => e.errors >= 3 && e.errors / e.count >= 0.5) ?? null)
 
 function clock(minute: number): string {
   return new Date(minute * 60_000).toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' })
 }
 /** "10 nov. 14:05": counting can start days before today, so the date is part of it. */
-function since(ms: number): string {
+function since_(ms: number): string {
   return new Date(ms).toLocaleString('nl-NL', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
 }
 function pct(n: number): string {
@@ -71,11 +117,18 @@ function bar(part: number, of: number): string {
 </script>
 
 <template>
-  <EmptyState v-if="stats && total === 0" icon="chart" title="Nog geen aanroepen">
-    Zodra een AI-client EB MCP gebruikt, zie je hier het verkeer: aanroepen per minuut, duur per endpoint, fouten en data. EB MCP bewaart het, ook na een herstart of update. Geteld vanaf {{ since(stats.startedAt) }}.
+  <EmptyState v-if="stats && period === 'all' && total === 0" icon="chart" title="Nog geen aanroepen">
+    Zodra een AI-client EB MCP gebruikt, zie je hier het verkeer: aanroepen per minuut, duur per endpoint, fouten en data. EB MCP bewaart het, ook na een herstart of update. Geteld vanaf {{ since_(stats.startedAt) }}.
   </EmptyState>
 
-  <div v-else-if="stats" class="page">
+  <Teleport v-if="stats && !(period === 'all' && total === 0)" to="#toolbar-actions" defer>
+    <div class="seg" role="group" aria-label="Periode">
+      <button v-for="p in PERIODS" :key="p.id" type="button" :class="{ on: period === p.id }" :aria-pressed="period === p.id" @click="pick(p.id)">{{ p.label }}</button>
+    </div>
+  </Teleport>
+
+  <div v-if="stats && !(period === 'all' && total === 0)" class="page">
+    <p v-if="incomplete" class="notice">{{ incomplete }}</p>
     <div v-if="failing" class="banner rise" role="status">
       <strong>{{ failing.path }} faalt vaak.</strong> {{ failing.errors }} van {{ failing.count }} aanroepen gaven een fout. Mogelijk is e-Boekhouden aangepast of traag.
       <RouterLink class="btn small" to="/verzoeken">Naar de verzoeken</RouterLink>
@@ -90,7 +143,7 @@ function bar(part: number, of: number): string {
       <div class="group tile">
         <span class="tile-label">Aanroepen</span>
         <span class="tile-value">{{ total.toLocaleString('nl-NL') }}</span>
-        <span class="tile-sub">MCP {{ stats.mcp }} · e-Boekhouden {{ stats.eb }}</span>
+        <span class="tile-sub">{{ words }} · MCP {{ stats.mcp }} · e-Boekhouden {{ stats.eb }}</span>
       </div>
       <div class="group tile" :class="{ bad: recentErrors >= 3 }">
         <span class="tile-label">Foutpercentage</span>
@@ -112,30 +165,31 @@ function bar(part: number, of: number): string {
     <div class="grid">
       <section class="group card">
         <div class="card-head">
-          <h2>Aanroepen per minuut</h2>
-          <div class="seg" role="group" aria-label="Periode">
-            <button type="button" :class="{ on: range === 15 }" :aria-pressed="range === 15" @click="range = 15">15 min</button>
-            <button type="button" :class="{ on: range === 60 }" :aria-pressed="range === 60" @click="range = 60">60 min</button>
+          <h2>{{ chartTitle }}</h2>
+          <div class="seg" role="group" aria-label="Wat de grafiek toont">
+            <button type="button" :class="{ on: !live }" :aria-pressed="!live" @click="live = false; hover = null">{{ period === 'today' ? 'Vandaag' : '7 dagen' }}</button>
+            <button type="button" :class="{ on: live }" :aria-pressed="live" @click="live = true; hover = null">Laatste uur</button>
           </div>
         </div>
         <div class="legend">
-          <span><i class="sw eb" />e-Boekhouden</span><span><i class="sw mcp" />MCP</span><span><i class="sw err" />Fouten</span><span><i class="sw limit" />Rem {{ LIMIT_PER_MINUTE }} per minuut</span>
+          <span><i class="sw eb" />e-Boekhouden</span><span><i class="sw mcp" />MCP</span><span><i class="sw err" />Fouten</span>
+          <Transition name="fade"><span v-if="live"><i class="sw limit" />Rem {{ LIMIT_PER_MINUTE }} per minuut</span></Transition>
         </div>
         <div class="chart" @mouseleave="hover = null">
-          <span v-for="v in [0, 20, 40, 60]" :key="v" class="grid-line" :style="{ bottom: `${(v / top) * 100}%` }"><span>{{ v }}</span></span>
-          <span class="limit" :style="{ bottom: `${(LIMIT_PER_MINUTE / top) * 100}%` }" />
-          <div class="bars" role="img" :aria-label="`Aanroepen per minuut, laatste ${range} minuten`">
-            <span v-for="(x, i) in minutes" :key="x.at" class="col" :class="{ dim: hover !== null && hover !== i }" @mouseenter="hover = i">
+          <span v-for="v in gridLines" :key="v" class="grid-line" :style="{ bottom: `${(v / top) * 100}%` }"><span>{{ v }}</span></span>
+          <Transition name="fade"><span v-if="live" class="limit" :style="{ bottom: `${(LIMIT_PER_MINUTE / top) * 100}%` }" /></Transition>
+          <div class="bars" :class="{ wide: !live }" role="img" :aria-label="`${chartTitle}, ${live ? 'het laatste uur' : words}`">
+            <span v-for="(x, i) in bars" :key="x.key" class="col" :class="{ dim: hover !== null && hover !== i }" @mouseenter="hover = i">
               <span class="seg-err" :style="{ height: `${(x.m.errors / top) * 100}%` }" />
               <span class="seg-mcp" :style="{ height: `${(x.m.mcp / top) * 100}%` }" />
               <span class="seg-eb" :style="{ height: `${(x.m.eb / top) * 100}%` }" />
             </span>
           </div>
-          <div v-if="hovered" class="tip" role="tooltip" :style="{ left: `${((hover! + 0.5) / minutes.length) * 100}%` }">
-            <strong>{{ clock(hovered.at) }}</strong><br />e-Boekhouden {{ hovered.m.eb }} · MCP {{ hovered.m.mcp }}<br />Fouten {{ hovered.m.errors }}
+          <div v-if="hovered" class="tip" role="tooltip" :style="{ left: `${Math.min(88, Math.max(12, ((hover! + 0.5) / bars.length) * 100))}%` }">
+            <strong>{{ hovered.label }}</strong><br />e-Boekhouden {{ hovered.m.eb }} · MCP {{ hovered.m.mcp }}<br />Fouten {{ hovered.m.errors }}
           </div>
         </div>
-        <div class="axis"><span>{{ clock(minutes[0]!.at) }}</span><span>nu</span></div>
+        <div class="axis" :class="{ days: !live && period !== 'today' }"><span v-for="(label, i) in axis" :key="i">{{ label }}</span></div>
       </section>
 
       <div class="side">
@@ -219,7 +273,11 @@ function bar(part: number, of: number): string {
 .card h2 { font-size: 13px; font-weight: 700; }
 .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .seg { display: inline-flex; padding: 2px; border-radius: 999px; background: var(--subtle); }
-.seg button { height: 22px; padding: 0 10px; border: 0; border-radius: 999px; background: transparent; font-size: 12px; transition: background-color 180ms var(--ease); }
+.seg button { height: 22px; padding: 0 10px; border: 0; border-radius: 999px; background: transparent; font-size: 12px; transition: background-color 180ms var(--ease), box-shadow 180ms var(--ease); }
+.seg button:not(.on):hover { background: var(--hover); }
+.notice { font-size: 12px; color: var(--muted); }
+.fade-enter-active, .fade-leave-active { transition: opacity 150ms ease; }
+.fade-enter-from, .fade-leave-to { opacity: 0; }
 .seg button.on { background: var(--seg-on); box-shadow: var(--seg-on-shadow); font-weight: 500; }
 .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 11px; color: var(--label); }
 .legend span { display: flex; align-items: center; gap: 5px; }
@@ -235,6 +293,10 @@ function bar(part: number, of: number): string {
 .chart > .limit { position: absolute; left: 0; right: 0; border-top: 2px dashed #ff9f0a; opacity: 0.8; }
 .bars { position: absolute; inset: 0; display: flex; align-items: flex-end; gap: 2px; }
 .col { flex: 1; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; transition: opacity 150ms ease; }
+.col > span { transition: height 200ms var(--ease); }
+/* Hours and days are few: wider bars with more air between them. */
+.bars.wide { gap: 6px; }
+.bars.wide .col > span:first-child { border-radius: 3px 3px 0 0; }
 .col.dim { opacity: 0.5; }
 .seg-eb { background: #0a84ff; }
 .seg-mcp { background: #af52de; }
@@ -245,6 +307,8 @@ function bar(part: number, of: number): string {
 }
 @keyframes tip { from { opacity: 0; transform: translate(-50%, 4px); } to { opacity: 1; transform: translateX(-50%); } }
 .axis { margin-left: 24px; display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); }
+/* A label under each day's bar. */
+.axis.days span { flex: 1; text-align: center; }
 .bar-row { display: grid; grid-template-columns: minmax(0, 1.2fr) 1fr 40px; gap: 8px; align-items: center; font-size: 12px; }
 .bar-label { display: flex; flex-direction: column; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .bar-label small { font-size: 10px; color: var(--muted); }

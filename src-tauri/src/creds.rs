@@ -1,12 +1,12 @@
 //! Reading an account's credentials at sign-in, and only then.
 //!
-//! - 1Password: `op read` on the item's username and password fields. The
+//! - 1Password: `op inject` fills in the item's username and password in one start of `op`. The
 //!   1Password app asks the user itself. Stopping the sign-in kills `op`, and
 //!   so does a 1Password that gives no answer within 2 minutes.
 //! - System store: the password from the Keychain or Credential Manager, after
 //!   Touch ID or Windows Hello confirms it is the user.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
@@ -86,17 +86,41 @@ fn confirm_text(label: &str) -> String {
     format!("EB MCP wil het wachtwoord van {label} gebruiken")
 }
 
+/// Whether both parts of `op://vault/item` hold only what a reference inside an `op inject` template may:
+/// letters, digits, `-`, `_` and `.`. The references the item picker makes are ids, which always do; one typed
+/// by hand with a name that has a space in it does not.
+fn plain_reference(reference: &str) -> bool {
+    reference.strip_prefix("op://").is_some_and(|rest| {
+        rest.split('/').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+    })
+}
+
+/// The username and password out of what `op inject` wrote for the two-line template: the username is the
+/// first line, the password the rest, without the line end `op` may put after it.
+fn split_injected(output: &str) -> Option<(String, String)> {
+    let (username, password) = output.split_once('\n')?;
+    let password = password
+        .strip_suffix('\n')
+        .unwrap_or(password)
+        .trim_end_matches('\r');
+    Some((
+        username.trim_end_matches('\r').to_owned(),
+        password.to_owned(),
+    ))
+}
+
 fn read_1password(reference: &str, cancel: &AtomicBool) -> Result<Credentials, CredError> {
     let op = op_binary().ok_or_else(|| CredError("De 1Password-CLI (op) is niet gevonden. Installeer hem en zet de koppeling met de 1Password-app aan.".into()))?;
-    // One deadline for both fields: the user answers 1Password's prompt once.
+    // One deadline for the whole read: the user answers 1Password's prompt once.
     let deadline = Instant::now() + OP_TIMEOUT;
-    let field = |name: &str| -> Result<String, CredError> {
-        let waited = wait_child(
-            Command::new(&op).args(["read", "--no-newline", &format!("{reference}/{name}")]),
-            cancel,
-            deadline,
-        )
-        .map_err(|e| CredError(format!("1Password-CLI start niet: {e}")))?;
+    let run = |command: &mut Command, input: Option<&[u8]>| -> Result<String, CredError> {
+        let waited = wait_child(command, input, cancel, deadline)
+            .map_err(|e| CredError(format!("1Password-CLI start niet: {e}")))?;
         let output = match waited {
             Waited::Exited(output) => output,
             Waited::Cancelled => return Err(CredError("Inloggen gestopt".into())),
@@ -114,8 +138,22 @@ fn read_1password(reference: &str, cancel: &AtomicBool) -> Result<Credentials, C
         String::from_utf8(output.stdout)
             .map_err(|_| CredError("1Password gaf geen leesbare tekst".into()))
     };
-    let username = field("username")?;
-    let password = field("password")?;
+    // Each start of `op` takes over a second, most of it talking to the 1Password app. `op inject` fills in
+    // both fields in one start; a reference it cannot take in a template is read field by field.
+    let (username, password) = if plain_reference(reference) {
+        let template = format!("{{{{ {reference}/username }}}}\n{{{{ {reference}/password }}}}");
+        let output = run(Command::new(&op).arg("inject"), Some(template.as_bytes()))?;
+        split_injected(&output)
+            .ok_or_else(|| CredError("1Password gaf geen leesbare tekst".into()))?
+    } else {
+        let field = |name: &str| {
+            run(
+                Command::new(&op).args(["read", "--no-newline", &format!("{reference}/{name}")]),
+                None,
+            )
+        };
+        (field("username")?, field("password")?)
+    };
     if username.is_empty() || password.is_empty() {
         return Err(CredError(format!(
             "Het item {reference} heeft geen gebruikersnaam of wachtwoord"
@@ -135,17 +173,30 @@ enum Waited {
 }
 
 /// Runs `command` to its end, unless `cancel` is set or `deadline` passes first: then the child is killed.
-/// Its output is read on threads meanwhile, so a full pipe never holds the child up.
+/// `input` is written to its standard input, which is then closed. Its output is read on threads meanwhile,
+/// so a full pipe never holds the child up.
 fn wait_child(
     command: &mut Command,
+    input: Option<&[u8]>,
     cancel: &AtomicBool,
     deadline: Instant,
 ) -> std::io::Result<Waited> {
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        let input = input.to_vec();
+        // On its own thread: a child that does not read must not hold up the wait for a stop or the deadline.
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+    }
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
     loop {
@@ -447,7 +498,10 @@ mod win {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpListError, confirm_text, list_error, op_message, parse_items};
+    use super::{
+        OpListError, confirm_text, list_error, op_message, parse_items, plain_reference,
+        split_injected,
+    };
 
     const LIST: &str = r#"[
       {"id":"itm1","title":"Zakelijke bank","version":3,"vault":{"id":"vlt1","name":"Werk"},"category":"LOGIN",
@@ -529,6 +583,7 @@ mod tests {
             let started = Instant::now();
             let waited = wait_child(
                 Command::new("sleep").arg("30"),
+                None,
                 &never,
                 Instant::now() + Duration::from_millis(300),
             )
@@ -545,6 +600,7 @@ mod tests {
             let started = Instant::now();
             let waited = wait_child(
                 Command::new("sleep").arg("30"),
+                None,
                 &cancel,
                 Instant::now() + Duration::from_secs(60),
             )
@@ -558,6 +614,7 @@ mod tests {
             let never = AtomicBool::new(false);
             let waited = wait_child(
                 Command::new("sh").args(["-c", "printf hallo; printf oeps >&2; exit 3"]),
+                None,
                 &never,
                 Instant::now() + Duration::from_secs(30),
             )
@@ -571,12 +628,48 @@ mod tests {
             assert!(
                 wait_child(
                     &mut Command::new("/nonexistent/op"),
+                    None,
                     &never,
                     Instant::now() + Duration::from_secs(1)
                 )
                 .is_err()
             );
+            // What goes in on standard input comes out: how the template reaches `op inject`.
+            let Waited::Exited(output) = wait_child(
+                &mut Command::new("cat"),
+                Some(b"een\ntwee"),
+                &never,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap() else {
+                panic!("cat should have ended at the end of its input")
+            };
+            assert_eq!(output.stdout, b"een\ntwee");
         }
+    }
+
+    #[test]
+    fn one_start_of_op_reads_both_fields_of_a_reference_made_of_ids() {
+        assert!(plain_reference("op://abcvault123/xyzitem456"));
+        assert!(plain_reference("op://Werk/e-Boekhouden_1.2"));
+        // A name with a space, or anything a template could read as its own syntax, is read field by field.
+        assert!(!plain_reference("op://Werk/e-Boekhouden Studio Noord"));
+        assert!(!plain_reference("op://Werk/a}}b"));
+        assert!(!plain_reference("Werk/EB"));
+        assert_eq!(
+            split_injected("jan@studionoord.example\ngeheim\n"),
+            Some(("jan@studionoord.example".into(), "geheim".into()))
+        );
+        // Without a line end after the password, with Windows line ends, and a password that ends in a space.
+        assert_eq!(
+            split_injected("jan\r\nge heim \r\n"),
+            Some(("jan".into(), "ge heim ".into()))
+        );
+        assert_eq!(
+            split_injected("jan\ngeheim"),
+            Some(("jan".into(), "geheim".into()))
+        );
+        assert_eq!(split_injected("alleen een regel"), None);
     }
 
     #[test]

@@ -150,7 +150,7 @@ function onInput() {
     </Transition>
     <div v-if="running || ended" class="debug">
       <button type="button" class="btn small ghost" :aria-expanded="showDetails" @click="showDetails = !showDetails">
-        <Icon name="list" :size="14" />{{ showDetails ? 'Verberg details' : 'Details' }}
+        <Icon name="list" :size="14" />{{ showDetails ? 'Verberg details' : 'Toon details' }}
       </button>
     </div>
     <Transition name="accordion">

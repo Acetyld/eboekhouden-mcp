@@ -84,7 +84,7 @@ describe('accounts page', () => {
 
   it('names the unlock of this system and how long a session runs', async () => {
     const wrapper = await mountAt('/accounts')
-    store.accounts = [account({ session: { accountId: 'a1', label: 'Studio Noord', administration: null, startedAt: Date.now(), expired: false } })]
+    store.accounts = [account({ session: { accountId: 'a1', label: 'Studio Noord', administration: null, startedAt: Date.now(), lastUsedAt: Date.now(), expired: false } })]
     await flushPromises()
     expect(wrapper.text()).toContain(`${unlockName} bij elk gebruik`)
     expect(wrapper.find('.session').text()).toMatch(/ingelogd/i)
@@ -105,7 +105,7 @@ describe('accounts page', () => {
   it('offers Alles inloggen for several accounts, and only while one of them is signed out', async () => {
     const wrapper = await mountAt('/accounts')
     const all = () => wrapper.findAll('#toolbar-actions .btn').find((b) => b.text() === 'Alles inloggen')
-    const session = (id: string) => ({ accountId: id, label: id, administration: null, startedAt: Date.now(), expired: false })
+    const session = (id: string) => ({ accountId: id, label: id, administration: null, startedAt: Date.now(), lastUsedAt: Date.now(), expired: false })
     // One account has its own Inloggen: no button for all.
     store.accounts = [account({})]
     await flushPromises()
@@ -132,25 +132,84 @@ describe('accounts page', () => {
     // The one that waits for its turn says so, in its row and in its steps.
     const rows = wrapper.findAll('.session-text').map((r) => r.text())
     expect(rows).toEqual(['Bezig met inloggen…', 'Wacht op zijn beurt…'])
-    await wrapper.findAll('.actions .btn').find((b) => b.attributes('aria-label') === 'Inloggen van Tweede volgen')!.trigger('click')
+    await wrapper.findAll('.session .link').find((b) => b.attributes('aria-label') === 'Details van het inloggen bij Tweede')!.trigger('click')
     await flushPromises()
     expect(wrapper.find('[role="dialog"]').text()).toContain('Wachten tot een andere aanmelding klaar is')
     wrapper.unmount()
   })
 
-  it('offers to follow a sign-in started elsewhere and shows its steps', async () => {
+  it('signs in out of sight: the row says how it goes and Toon details opens the steps', async () => {
+    const wrapper = await mountAt('/accounts')
+    store.accounts = [account({ signingIn: true })]
+    store.signins = { a1: { accountId: 'a1', step: 'submit', message: null } }
+    await flushPromises()
+    // No dialog on its own; the row is busy and cannot be started twice.
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+    expect(wrapper.find('.session-text').text()).toBe('Bezig met inloggen…')
+    expect(wrapper.find('.actions .btn').attributes('disabled')).toBeDefined()
+    const details = wrapper.find('.session .link')
+    expect(details.text()).toBe('Toon details')
+    await details.trigger('click')
+    await flushPromises()
+    const sheet = wrapper.find('[role="dialog"]')
+    expect(sheet.attributes('aria-label')).toBe('Inloggen bij Studio Noord')
+    expect(sheet.find('li.run').text()).toBe('Inloggen bij e-Boekhouden')
+    wrapper.unmount()
+  })
+
+  it('opens the steps by itself when a sign-in asks for a two-step code', async () => {
     const wrapper = await mountAt('/accounts')
     store.accounts = [account({ signingIn: true })]
     store.signins = { a1: { accountId: 'a1', step: 'code', message: null } }
     await flushPromises()
-    const follow = wrapper.find('.actions .btn')
-    expect(follow.text()).toBe('Volgen')
-    expect(follow.attributes('disabled')).toBeUndefined()
-    await follow.trigger('click')
-    await flushPromises()
     const sheet = wrapper.find('[role="dialog"]')
     expect(sheet.attributes('aria-label')).toBe('Inloggen bij Studio Noord')
     expect(sheet.text()).toContain('Tweestapsverificatie')
+    wrapper.unmount()
+  })
+
+  it('says in the row that a sign-in failed, with the reason within reach', async () => {
+    const wrapper = await mountAt('/accounts')
+    store.accounts = [account({})]
+    store.signins = { a1: { accountId: 'a1', step: 'failed', message: 'Gebruikersnaam en/of wachtwoord is onjuist.' } }
+    await flushPromises()
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+    const text = wrapper.find('.session-text')
+    expect(text.text()).toBe('Inloggen mislukt')
+    expect(text.attributes('title')).toBe('Gebruikersnaam en/of wachtwoord is onjuist.')
+    await wrapper.find('.session .link').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[role="dialog"]').text()).toContain('Gebruikersnaam en/of wachtwoord is onjuist.')
+    wrapper.unmount()
+  })
+
+  it('says how long a session still stands, counted from its last use', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000)
+    const wrapper = await mountAt('/accounts')
+    const now = Date.now()
+    store.accounts = [account({ session: { accountId: 'a1', label: 'Studio Noord', administration: null, startedAt: now - 50 * 60_000, lastUsedAt: now - 4 * 60_000, expired: false } })]
+    await flushPromises()
+    expect(wrapper.find('.session-text').text()).toBe('50 min ingelogd')
+    // 30 minutes of silence (the default) from the last use, 4 minutes ago.
+    expect(wrapper.find('.session .sub').text()).toBe('Nog 26 min geldig')
+    expect(wrapper.find('.session .sub').attributes('title')).toContain('30 minuten na het laatste gebruik')
+    wrapper.unmount()
+  })
+
+  it('opens an account for editing when its row is clicked, but not from its buttons', async () => {
+    const wrapper = await mountAt('/accounts')
+    store.accounts = [account({})]
+    await flushPromises()
+    // Verwijderen in the row asks its own question and does not open the form behind it.
+    await wrapper.find('.actions .icon-btn.danger').trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('Studio Noord verwijderen?')
+    expect(wrapper.findAll('[aria-label="Studio Noord bewerken"][role="dialog"]')).toHaveLength(0)
+    await wrapper.findAll('button').find((b) => b.text() === 'Annuleren')!.trigger('click')
+    await flushPromises()
+    await wrapper.find('.row.pick').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[role="dialog"]').attributes('aria-label')).toMatch(/Studio Noord bewerken/)
     wrapper.unmount()
   })
 
@@ -159,7 +218,7 @@ describe('accounts page', () => {
     store.accounts = [account({ signingIn: true })]
     store.signins = { a1: { accountId: 'a1', step: 'administration', message: null } }
     await flushPromises()
-    await wrapper.find('.actions .btn').trigger('click')
+    await wrapper.find('.session .link').trigger('click')
     await flushPromises()
     const sheet = wrapper.find('[role="dialog"]')
     expect(sheet.find('li.run').text()).toBe('Administratie ophalen')
@@ -169,7 +228,7 @@ describe('accounts page', () => {
     expect(sheet.findAll('li.run')).toHaveLength(0)
     expect(sheet.findAll('li.done')).toHaveLength(3)
     expect(sheet.text()).toContain('Ingelogd bij Studio Noord B.V.')
-    expect(sheet.find('.debug .btn').text()).toBe('Details')
+    expect(sheet.find('.debug .btn').text()).toBe('Toon details')
     wrapper.unmount()
   })
 

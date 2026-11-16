@@ -49,6 +49,9 @@ pub const CAPACITY: usize = 1000;
 const BODY_LIMIT: usize = 256 * 1024;
 const DURATIONS_KEPT: usize = 500;
 const MINUTES_KEPT: u64 = 24 * 60;
+/// How long the counts per hour are kept: the Dashboard's longest period with a start is seven days, and
+/// its first day began up to a day before those seven times 24 hours.
+const HOURS_KEPT: u64 = 8 * 24;
 pub const MASK: &str = "••••••••";
 /// The app version that made an entry.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -209,6 +212,10 @@ struct Stats {
     clients: HashMap<String, (u32, u32)>,
     accounts: HashMap<String, u32>,
     statuses: HashMap<String, u32>,
+    /// The same counts per hour (hours since the epoch), for the Dashboard's periods: Vandaag, 7 dagen. An
+    /// hour's own `minutes` and `hours` stay empty. Kept for `HOURS_KEPT`; counted since 0.6.4.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    hours: BTreeMap<u64, Stats>,
 }
 
 #[derive(Serialize)]
@@ -243,6 +250,11 @@ pub struct StatsView {
     pub p95_ms: u64,
     /// Minute buckets, oldest first, as (minute since epoch, counts).
     pub minutes: Vec<(u64, Minute)>,
+    /// Hour buckets, oldest first, as (hour since epoch, counts): every hour that is kept, whatever the period.
+    pub hours: Vec<(u64, Minute)>,
+    /// The first hour (since the epoch) the counts per hour go back to: a period that starts before it is
+    /// not complete. `None` while nothing was counted per hour yet.
+    pub hours_from: Option<u64>,
     pub endpoints: Vec<EndpointStats>,
     pub tools: Vec<Named>,
     pub clients: Vec<Named>,
@@ -707,33 +719,10 @@ impl RequestLog {
             }
         }
         if call.status != 0 && !signin {
-            let mut s = self.stats.lock().unwrap();
-            s.eb += 1;
-            s.bytes_in += call.bytes as u64;
-            let failed = failed(call);
-            if failed {
-                s.errors += 1;
-            }
-            let minute = s.minute(at);
-            minute.eb += 1;
-            if failed {
-                minute.errors += 1;
-            }
-            s.eb_total_ms += call.duration_ms;
-            push_capped(&mut s.eb_durations, call.duration_ms as u32);
-            let endpoint = s.endpoints.entry(normalize(&call.path)).or_default();
-            endpoint.count += 1;
-            endpoint.total_ms += call.duration_ms;
-            push_capped(&mut endpoint.durations, call.duration_ms as u32);
-            endpoint.bytes += call.bytes as u64;
-            if failed {
-                endpoint.errors += 1;
-            }
-            s.clients.entry(client.to_owned()).or_default().1 += 1;
-            if let Some(label) = label {
-                *s.accounts.entry(label).or_default() += 1;
-            }
-            *s.statuses.entry(call.status.to_string()).or_default() += 1;
+            self.stats
+                .lock()
+                .unwrap()
+                .count_eb(at, call, client, label.as_deref());
         }
         // Once more after the link to the parent and the statistics, so a save that copied the
         // log in between is followed by another.
@@ -787,8 +776,22 @@ impl RequestLog {
         }
     }
 
-    pub fn stats(&self) -> StatsView {
-        let s = self.stats.lock().unwrap();
+    /// The statistics over everything counted, or with `since` (an hour since the epoch) over the hours from
+    /// that one on. The minute and hour buckets are always all that is kept.
+    pub fn stats(&self, since: Option<u64>) -> StatsView {
+        let all = self.stats.lock().unwrap();
+        let summed;
+        let s: &Stats = match since {
+            None => &all,
+            Some(since) => {
+                let mut sum = Stats::default();
+                for hour in all.hours.range(since..).map(|(_, hour)| hour) {
+                    sum.merge(hour);
+                }
+                summed = sum;
+                &summed
+            }
+        };
         let named = |map: &HashMap<String, u32>| {
             let mut list: Vec<Named> = map
                 .iter()
@@ -829,7 +832,7 @@ impl RequestLog {
                 .then(a.name.cmp(&b.name))
         });
         StatsView {
-            started_at: s.started_at,
+            started_at: all.started_at,
             mcp: s.mcp,
             eb: s.eb,
             errors: s.errors,
@@ -837,7 +840,22 @@ impl RequestLog {
             bytes_out: s.bytes_out,
             avg_ms: s.eb_total_ms / u64::from(s.eb.max(1)),
             p95_ms: p95(&s.eb_durations),
-            minutes: s.minutes.iter().map(|(k, v)| (*k, *v)).collect(),
+            minutes: all.minutes.iter().map(|(k, v)| (*k, *v)).collect(),
+            hours: all
+                .hours
+                .iter()
+                .map(|(k, hour)| {
+                    (
+                        *k,
+                        Minute {
+                            eb: hour.eb,
+                            mcp: hour.mcp,
+                            errors: hour.errors,
+                        },
+                    )
+                })
+                .collect(),
+            hours_from: all.hours.keys().next().copied(),
             endpoints,
             tools: named(&s.tools),
             clients,
@@ -876,23 +894,111 @@ impl Stats {
         }
     }
 
-    /// Counts a finished MCP call.
+    /// The counts of the hour `at_ms` falls in. Hours older than `HOURS_KEPT` before it are dropped.
+    fn hour(&mut self, at_ms: u64) -> &mut Stats {
+        let hour = at_ms / 3_600_000;
+        while self
+            .hours
+            .first_key_value()
+            .is_some_and(|(k, _)| *k + HOURS_KEPT < hour)
+        {
+            self.hours.pop_first();
+        }
+        self.hours.entry(hour).or_default()
+    }
+
+    /// Counts a finished MCP call: in the totals, in its minute and in its hour.
     fn count_mcp(&mut self, e: &McpEntry) {
         let failed = e.outcome != Outcome::Ok;
-        self.mcp += 1;
-        self.bytes_out += e.bytes as u64;
-        if failed {
-            self.errors += 1;
-        }
+        self.add_mcp(e);
         let minute = self.minute(e.at);
         minute.mcp += 1;
         if failed {
             minute.errors += 1;
         }
+        self.hour(e.at).add_mcp(e);
+    }
+
+    fn add_mcp(&mut self, e: &McpEntry) {
+        self.mcp += 1;
+        self.bytes_out += e.bytes as u64;
+        if e.outcome != Outcome::Ok {
+            self.errors += 1;
+        }
         *self.tools.entry(e.tool.clone()).or_default() += 1;
         self.clients.entry(e.client.clone()).or_default().0 += 1;
         if e.outcome == Outcome::Refused {
             *self.statuses.entry("Geweigerd".into()).or_default() += 1;
+        }
+    }
+
+    /// Counts a call to e-Boekhouden that started at `at`: in the totals, in its minute and in its hour.
+    fn count_eb(&mut self, at: u64, call: &ApiCall, client: &str, account: Option<&str>) {
+        self.add_eb(call, client, account);
+        let failed = failed(call);
+        let minute = self.minute(at);
+        minute.eb += 1;
+        if failed {
+            minute.errors += 1;
+        }
+        self.hour(at).add_eb(call, client, account);
+    }
+
+    fn add_eb(&mut self, call: &ApiCall, client: &str, account: Option<&str>) {
+        let failed = failed(call);
+        self.eb += 1;
+        self.bytes_in += call.bytes as u64;
+        if failed {
+            self.errors += 1;
+        }
+        self.eb_total_ms += call.duration_ms;
+        push_capped(&mut self.eb_durations, call.duration_ms as u32);
+        let endpoint = self.endpoints.entry(normalize(&call.path)).or_default();
+        endpoint.count += 1;
+        endpoint.total_ms += call.duration_ms;
+        push_capped(&mut endpoint.durations, call.duration_ms as u32);
+        endpoint.bytes += call.bytes as u64;
+        if failed {
+            endpoint.errors += 1;
+        }
+        self.clients.entry(client.to_owned()).or_default().1 += 1;
+        if let Some(account) = account {
+            *self.accounts.entry(account.to_owned()).or_default() += 1;
+        }
+        *self.statuses.entry(call.status.to_string()).or_default() += 1;
+    }
+
+    /// Adds the counts of `other` (an hour) to these, for a period of several hours. Every duration counts
+    /// for the period's p95: the hours each keep only their last few hundred.
+    fn merge(&mut self, other: &Stats) {
+        self.mcp += other.mcp;
+        self.eb += other.eb;
+        self.errors += other.errors;
+        self.bytes_in += other.bytes_in;
+        self.bytes_out += other.bytes_out;
+        self.eb_total_ms += other.eb_total_ms;
+        self.eb_durations.extend(&other.eb_durations);
+        for (path, theirs) in &other.endpoints {
+            let ours = self.endpoints.entry(path.clone()).or_default();
+            ours.count += theirs.count;
+            ours.total_ms += theirs.total_ms;
+            ours.durations.extend(&theirs.durations);
+            ours.errors += theirs.errors;
+            ours.bytes += theirs.bytes;
+        }
+        for (name, count) in &other.tools {
+            *self.tools.entry(name.clone()).or_default() += count;
+        }
+        for (name, (mcp, eb)) in &other.clients {
+            let ours = self.clients.entry(name.clone()).or_default();
+            ours.0 += mcp;
+            ours.1 += eb;
+        }
+        for (name, count) in &other.accounts {
+            *self.accounts.entry(name.clone()).or_default() += count;
+        }
+        for (name, count) in &other.statuses {
+            *self.statuses.entry(name.clone()).or_default() += count;
         }
     }
 }
@@ -1044,6 +1150,81 @@ mod tests {
     }
 
     #[test]
+    fn a_period_counts_only_its_own_hours() {
+        let hour = |n: u64| n * 3_600_000 + 5_000;
+        let mut stats = Stats::default();
+        let entry = |at: u64, tool: &str, outcome: Outcome| -> McpEntry {
+            let mut entry: McpEntry = serde_json::from_value(json!({
+                "id": 1, "at": at, "client": "Claude", "tool": tool, "args": null, "account": null,
+                "outcome": "ok", "durationMs": 1, "bytes": 10, "error": null, "calls": []
+            }))
+            .unwrap();
+            entry.outcome = outcome;
+            entry
+        };
+        stats.count_mcp(&entry(hour(100), "relaties", Outcome::Ok));
+        stats.count_eb(
+            hour(100),
+            &call("relatie/1", 200, 100),
+            "Claude",
+            Some("SN"),
+        );
+        stats.count_mcp(&entry(hour(130), "mutaties", Outcome::Error));
+        stats.count_eb(
+            hour(130),
+            &call("relatie/2", 500, 300),
+            "Claude",
+            Some("SN"),
+        );
+        stats.count_eb(hour(131), &call("mutatie/3", 200, 500), "Claude", None);
+        let log = RequestLog::default();
+        *log.stats.lock().unwrap() = stats;
+
+        let all = log.stats(None);
+        assert_eq!((all.mcp, all.eb, all.errors), (2, 3, 2));
+        assert_eq!(
+            all.hours.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+            [100, 130, 131]
+        );
+        assert_eq!(all.hours_from, Some(100));
+
+        // From hour 130 on: the first hour's calls are out, in every list.
+        let period = log.stats(Some(130));
+        assert_eq!((period.mcp, period.eb, period.errors), (1, 2, 2));
+        assert_eq!(period.bytes_out, 10);
+        assert_eq!(
+            period
+                .tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            ["mutaties"]
+        );
+        assert_eq!((period.clients[0].count, period.clients[0].eb), (1, 2));
+        assert_eq!(period.accounts[0].count, 1);
+        assert_eq!(period.avg_ms, 400);
+        assert_eq!(period.p95_ms, 500);
+        let paths: Vec<&str> = period.endpoints.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["mutatie/{id}", "relatie/{id}"]);
+        // The buckets are the same whatever the period, for the chart.
+        assert_eq!(period.hours.len(), 3);
+        // A period after the last call is empty, not an error.
+        assert_eq!(log.stats(Some(200)).eb, 0);
+
+        // Hours older than what is kept are dropped when a newer one is counted.
+        let mut stats = log.stats.lock().unwrap().clone();
+        stats.count_eb(
+            hour(100 + HOURS_KEPT + 1),
+            &call("relatie/9", 200, 1),
+            "Claude",
+            None,
+        );
+        assert!(!stats.hours.contains_key(&100));
+        assert!(stats.hours.contains_key(&130));
+        assert_eq!(stats.eb, 4, "the totals keep counting");
+    }
+
+    #[test]
     fn clearing_keeps_the_statistics() {
         let log = RequestLog::default();
         log.add_eb(
@@ -1062,7 +1243,7 @@ mod tests {
         );
         log.clear();
         assert_eq!(log.len(), 0);
-        let stats = log.stats();
+        let stats = log.stats(None);
         assert_eq!((stats.eb, stats.errors), (2, 1));
         assert_eq!(stats.endpoints[0].path, "relatie/{id}");
         assert_eq!(stats.endpoints[0].count, 2);
@@ -1094,7 +1275,7 @@ mod tests {
             .filter(|e| matches!(e, Entry::Eb(eb) if eb.signin))
             .count();
         assert_eq!(signins, 2);
-        let stats = log.stats();
+        let stats = log.stats(None);
         assert_eq!((stats.eb, stats.errors), (1, 1));
         assert_eq!(stats.minutes.len(), 1);
         assert_eq!((stats.minutes[0].1.eb, stats.minutes[0].1.errors), (1, 1));
@@ -1125,7 +1306,7 @@ mod tests {
         let log = RequestLog::default();
         let a = log.start_mcp("Cursor", "get", json!({"pad": "mutatie/opslaan"}), None);
         log.finish_mcp(a, Outcome::Refused, None, Some("niet toegestaan".into()));
-        let stats = log.stats();
+        let stats = log.stats(None);
         assert_eq!((stats.mcp, stats.errors), (1, 1));
         assert_eq!(stats.statuses[0].name, "Geweigerd");
     }
@@ -1146,7 +1327,7 @@ mod tests {
             panic!()
         };
         assert_eq!((m.outcome, m.proposal), (Outcome::Waiting, Some(7)));
-        assert_eq!(log.stats().mcp, 0, "not counted before it ends");
+        assert_eq!(log.stats(None).mcp, 0, "not counted before it ends");
         log.resume_mcp(id);
         assert_eq!(log.running(), 1);
         log.finish_mcp(id, Outcome::Ok, Some(&json!({"mutNr": 1})), None);
@@ -1155,7 +1336,7 @@ mod tests {
             panic!()
         };
         assert_eq!(m.outcome, Outcome::Ok, "the first end stays");
-        assert_eq!(log.stats().mcp, 1);
+        assert_eq!(log.stats(None).mcp, 1);
         let listed = serde_json::to_value(log.list()).unwrap();
         assert_eq!(listed[0]["proposal"], 7);
     }
@@ -1366,7 +1547,7 @@ mod tests {
         log.add_eb(&call("mutatie", 200, 300), Some(id), "Claude", None, true);
         log.finish_mcp(id, Outcome::Ok, None, None);
         assert!(mcp(&log, id).waited_ms >= 60);
-        let stats = log.stats();
+        let stats = log.stats(None);
         assert_eq!((stats.mcp, stats.eb), (1, 2));
         assert_eq!(stats.avg_ms, 200, "the e-Boekhouden calls only");
         assert_eq!(stats.p95_ms, 300);
@@ -1404,7 +1585,7 @@ mod tests {
             None,
             true,
         );
-        assert_eq!(log.stats().errors, 0);
+        assert_eq!(log.stats(None).errors, 0);
         // Any other redirect is the login page, and a redirect with an error stays a failure.
         log.add_eb(
             &call("relatie/gridtable", 302, 40),
@@ -1416,7 +1597,7 @@ mod tests {
         let mut lost = call("offertesjabloon/editor/5/NL", 302, 40);
         lost.error = Some("Niet (meer) ingelogd bij e-Boekhouden".into());
         log.add_eb(&lost, None, "Claude", None, true);
-        assert_eq!(log.stats().errors, 2);
+        assert_eq!(log.stats(None).errors, 2);
     }
 
     #[test]
