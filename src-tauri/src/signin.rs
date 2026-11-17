@@ -26,6 +26,8 @@ use crate::state::{AppState, CookieJar, now_ms};
 
 /// e-Boekhouden's login page, for "Open e-Boekhouden in je browser".
 pub const LOGIN_URL: &str = "https://secure.e-boekhouden.nl/bh/";
+/// How old a fetched login page may be when its form is posted.
+const STALE_PAGE: Duration = Duration::from_secs(60);
 /// How many finished sign-ins Instellingen › Diagnose keeps.
 const TRACES_KEPT: usize = 10;
 
@@ -100,10 +102,11 @@ pub const MAX_AT_ONCE: usize = 4;
 pub struct Signins {
     /// One permit per sign-in that is past the queue.
     slots: tokio::sync::Semaphore,
-    /// Held while one sign-in reads its username and password. 1Password and the system store ask the user
-    /// (Touch ID, a consent prompt): one question at a time, and an answer that unlocks the store serves the
-    /// reads that follow, where several at once would each put up their own prompt.
+    /// Held while one sign-in reads its password from the system store, which asks the user (Touch ID,
+    /// Windows Hello): one question at a time.
     reading: tokio::sync::Mutex<()>,
+    /// The 1Password reads of the sign-ins that run, taken together in one start of `op`.
+    op: creds::OpReader,
     pending: Mutex<HashMap<Uuid, Pending>>,
     /// The newest step of each account's latest sign-in, its end state included, until the next sign-in or
     /// the end of the app. Every window reads it with the accounts, so none depends on having heard each event.
@@ -119,6 +122,7 @@ impl Default for Signins {
         Self {
             slots: tokio::sync::Semaphore::new(MAX_AT_ONCE),
             reading: tokio::sync::Mutex::new(()),
+            op: creds::OpReader::default(),
             pending: Mutex::default(),
             last: Mutex::default(),
             traces: Mutex::default(),
@@ -410,32 +414,73 @@ async fn run(
         account_id,
         format!("Gegevens lezen uit {:?}", account.store),
     );
-    let credentials = {
-        let Some(_one_at_a_time) = unless_cancelled(cancel, signins.reading.lock()).await else {
-            return (Step::Cancelled, None);
-        };
-        creds::read(&account, cancel).await
-    };
-    crate::refocus_after_prompt(app);
-    let credentials = match credentials {
-        Ok(c) => {
-            signins.trace(account_id, "Gegevens gelezen");
-            c
+    // The login page needs no credentials: it is fetched while 1Password or the Keychain is read.
+    *called = true;
+    let (page, credentials) = tokio::join!(state.client.login_page(), async {
+        match account.store {
+            // 1Password reads for every sign-in that waits at once (creds.rs, `OpReader`).
+            crate::accounts::Store::OnePassword => {
+                unless_cancelled(cancel, creds::read(&account, cancel, &signins.op)).await
+            }
+            // The system store asks with Touch ID or Windows Hello: one question at a time.
+            crate::accounts::Store::System => {
+                let _one_at_a_time = unless_cancelled(cancel, signins.reading.lock()).await?;
+                Some(creds::read(&account, cancel, &signins.op).await)
+            }
         }
-        // Stopping kills the 1Password read; whatever it reported then, the user stopped it.
-        Err(_) if cancel.load(Ordering::SeqCst) => return (Step::Cancelled, None),
-        Err(e) => return (Step::Failed, Some(e.0)),
+    });
+    crate::refocus_after_prompt(app);
+    let stopped = |page: crate::ebapi::LoginPage, end: (Step, Option<String>)| {
+        for call in page.into_calls() {
+            state.log_signin_call(&call, account_id, &account.label);
+        }
+        end
+    };
+    let credentials = match credentials {
+        Some(Ok((credentials, together))) => {
+            signins.trace(
+                account_id,
+                match together {
+                    1 => "Gegevens gelezen".to_owned(),
+                    n => format!(
+                        "Gegevens gelezen, samen met {} andere accounts in één keer",
+                        n - 1
+                    ),
+                },
+            );
+            credentials
+        }
+        // Stopping ends the read; whatever it reported then, the user stopped it.
+        None => return stopped(page, (Step::Cancelled, None)),
+        Some(Err(_)) if cancel.load(Ordering::SeqCst) => {
+            return stopped(page, (Step::Cancelled, None));
+        }
+        Some(Err(e)) => return stopped(page, (Step::Failed, Some(e.0))),
     };
     if cancel.load(Ordering::SeqCst) {
-        return (Step::Cancelled, None);
+        return stopped(page, (Step::Cancelled, None));
     }
 
     emit(app, signins, account_id, Step::Submit, None);
     signins.trace(account_id, "Inloggen bij e-Boekhouden (inlogformulier)");
-    *called = true;
+    // A page that waited long for its credentials (a prompt left open) may have lost its session at
+    // e-Boekhouden: then a fresh one is fetched.
+    let page = if page.age() > STALE_PAGE {
+        signins.trace(
+            account_id,
+            "De inlogpagina is te oud geworden; opnieuw ophalen",
+        );
+        for call in page.into_calls() {
+            state.log_signin_call(&call, account_id, &account.label);
+        }
+        state.client.login_page().await
+    } else {
+        page
+    };
     let login = state
         .client
-        .login(
+        .login_submit(
+            page,
             &credentials.username,
             &credentials.password,
             device_number(account_id),

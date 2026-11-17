@@ -1,6 +1,7 @@
 //! Reading an account's credentials at sign-in, and only then.
 //!
-//! - 1Password: `op inject` fills in the item's username and password in one start of `op`. The
+//! - 1Password: `op inject` fills in the username and password of every account that signs in at that
+//!   moment, in one start of `op`. The
 //!   1Password app asks the user itself. Stopping the sign-in kills `op`, and
 //!   so does a 1Password that gives no answer within 2 minutes.
 //! - System store: the password from the Keychain or Credential Manager, after
@@ -9,8 +10,8 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -48,19 +49,22 @@ pub fn delete_password(id: Uuid) -> Result<(), String> {
     SystemStore.delete(&password_key(id))
 }
 
-/// Reads the account's username and password. Setting `cancel` stops a 1Password read: `op` is killed and
-/// the read ends with an error; the caller tells a stop from a failure by `cancel` itself.
-pub async fn read(account: &Account, cancel: &Arc<AtomicBool>) -> Result<Credentials, CredError> {
+/// Reads the account's username and password, and says how many accounts 1Password answered for in the
+/// same start of `op` (1 for the system store). Setting `cancel` stops a 1Password read: this account's part
+/// ends with an error, and `op` is killed once nobody waits for it; the caller tells a stop from a failure by
+/// `cancel` itself.
+pub async fn read(
+    account: &Account,
+    cancel: &Arc<AtomicBool>,
+    op: &OpReader,
+) -> Result<(Credentials, usize), CredError> {
     match account.store {
         Store::OnePassword => {
             let reference = account
                 .op_ref
                 .clone()
                 .ok_or_else(|| CredError("Geen 1Password-item ingesteld".into()))?;
-            let cancel = cancel.clone();
-            tokio::task::spawn_blocking(move || read_1password(&reference, &cancel))
-                .await
-                .map_err(|e| CredError(e.to_string()))?
+            op.read(reference, cancel).await
         }
         Store::System => {
             confirm_user(&confirm_text(&account.label)).await?;
@@ -73,12 +77,212 @@ pub async fn read(account: &Account, cancel: &Arc<AtomicBool>) -> Result<Credent
                             .into(),
                     )
                 })?;
-            Ok(Credentials {
-                username: account.username.clone(),
-                password,
-            })
+            Ok((
+                Credentials {
+                    username: account.username.clone(),
+                    password,
+                },
+                1,
+            ))
         }
     }
+}
+
+/// One sign-in's wish for its 1Password item.
+struct OpRequest {
+    reference: String,
+    cancel: Arc<AtomicBool>,
+    answer: tokio::sync::oneshot::Sender<OpAnswer>,
+}
+
+/// The credentials and how many accounts were read in the same start of `op`.
+type OpAnswer = Result<(Credentials, usize), CredError>;
+
+/// How long a read waits for other sign-ins to join it. Alles inloggen starts its sign-ins within a few
+/// milliseconds of each other; one start of `op` for all of them saves seconds, and this costs none to notice.
+const OP_GATHER: Duration = Duration::from_millis(40);
+
+/// The 1Password reads of sign-ins that run side by side, taken together: every start of `op` costs a second
+/// or two (it talks to the 1Password app each time), whatever it reads. So one read is one start of `op` for
+/// every sign-in that waits by then, and the user answers 1Password's prompt once.
+#[derive(Default)]
+pub struct OpReader {
+    waiting: Mutex<Vec<OpRequest>>,
+    /// Held by the sign-in whose turn it is to start `op`.
+    turn: tokio::sync::Mutex<()>,
+}
+
+impl OpReader {
+    async fn read(&self, reference: String, cancel: &Arc<AtomicBool>) -> OpAnswer {
+        self.read_through(reference, cancel, read_batch).await
+    }
+
+    /// Queues the wish, then takes a turn: whoever has the turn reads for everyone that waits, itself
+    /// included, through `run`. A wish that another sign-in's turn already served finds its turn empty.
+    async fn read_through(
+        &self,
+        reference: String,
+        cancel: &Arc<AtomicBool>,
+        run: fn(Vec<OpRequest>),
+    ) -> OpAnswer {
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        self.waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(OpRequest {
+                reference,
+                cancel: cancel.clone(),
+                answer,
+            });
+        {
+            let _turn = self.turn.lock().await;
+            tokio::time::sleep(OP_GATHER).await;
+            let batch =
+                std::mem::take(&mut *self.waiting.lock().unwrap_or_else(|e| e.into_inner()));
+            if !batch.is_empty() {
+                // On a thread of its own, and to its end even when this sign-in is stopped meanwhile: the
+                // others in the batch still wait for their answer.
+                let _ = tokio::task::spawn_blocking(move || run(batch)).await;
+            }
+        }
+        answered
+            .await
+            .unwrap_or_else(|_| Err(CredError("1Password gaf geen antwoord".into())))
+    }
+}
+
+/// Reads for every request in one go and answers each. Runs on a blocking thread.
+fn read_batch(batch: Vec<OpRequest>) {
+    let stopped = || CredError("Inloggen gestopt".into());
+    let (live, gone): (Vec<OpRequest>, Vec<OpRequest>) = batch
+        .into_iter()
+        .partition(|r| !r.cancel.load(Ordering::SeqCst));
+    for request in gone {
+        let _ = request.answer.send(Err(stopped()));
+    }
+    let Some(op) = op_binary() else {
+        for request in live {
+            let _ = request.answer.send(Err(CredError("De 1Password-CLI (op) is niet gevonden. Installeer hem en zet de koppeling met de 1Password-app aan.".into())));
+        }
+        return;
+    };
+    // One deadline for the whole read: the user answers 1Password's prompt once.
+    let deadline = Instant::now() + OP_TIMEOUT;
+    let (together, alone): (Vec<OpRequest>, Vec<OpRequest>) = live
+        .into_iter()
+        .partition(|r| plain_reference(&r.reference));
+    let mut one_by_one = alone;
+    if !together.is_empty() {
+        let references: Vec<&str> = together.iter().map(|r| r.reference.as_str()).collect();
+        let boundary = format!("--eb-mcp-{}--", Uuid::new_v4().simple());
+        // `op` is stopped only when nobody in the batch waits for it any more.
+        let nobody_waits = || together.iter().all(|r| r.cancel.load(Ordering::SeqCst));
+        let read = run_op(
+            Command::new(&op).arg("inject"),
+            Some(batch_template(&references, &boundary).as_bytes()),
+            &nobody_waits,
+            deadline,
+        );
+        let count = together.len();
+        match read {
+            Ok(output) => match split_batch(&output, &boundary, count) {
+                Some(found) => {
+                    for (request, (username, password)) in together.into_iter().zip(found) {
+                        let answer = if request.cancel.load(Ordering::SeqCst) {
+                            Err(stopped())
+                        } else if username.is_empty() || password.is_empty() {
+                            Err(CredError(format!(
+                                "Het item {} heeft geen gebruikersnaam of wachtwoord",
+                                request.reference
+                            )))
+                        } else {
+                            Ok((Credentials { username, password }, count))
+                        };
+                        let _ = request.answer.send(answer);
+                    }
+                }
+                None => {
+                    for request in together {
+                        let _ = request
+                            .answer
+                            .send(Err(CredError("1Password gaf geen leesbare tekst".into())));
+                    }
+                }
+            },
+            // 1Password said no to the whole read (locked, no consent, no answer, stopped): the same holds
+            // for every account in it, and asking again per account would put up a prompt for each.
+            Err(OpFailure::Refused(error)) => {
+                for request in together {
+                    let _ = request.answer.send(Err(CredError(error.0.clone())));
+                }
+            }
+            // One item of several is wrong and `op` does not say which in a way to rely on: each account
+            // is read on its own, so the right one gets the message.
+            Err(OpFailure::Item(_)) if count > 1 => one_by_one.extend(together),
+            Err(OpFailure::Item(stderr)) => {
+                for request in together {
+                    let _ = request
+                        .answer
+                        .send(Err(CredError(op_message(&stderr, &request.reference))));
+                }
+            }
+        }
+    }
+    for request in one_by_one {
+        let answer = if request.cancel.load(Ordering::SeqCst) {
+            Err(stopped())
+        } else {
+            read_one(&op, &request.reference, &request.cancel, deadline).map(|c| (c, 1))
+        };
+        let _ = request.answer.send(answer);
+    }
+}
+
+/// Why a start of `op` gave nothing.
+enum OpFailure {
+    /// It holds for whatever was asked: 1Password is locked or gave no consent or no answer, or the read was stopped.
+    Refused(CredError),
+    /// `op` ran and refused what was asked for; its stderr says what.
+    Item(String),
+}
+
+/// Whether `op`'s stderr is about 1Password itself and not about the item that was asked for.
+fn about_1password(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("locked")
+        || lower.contains("authorization")
+        || lower.contains("not signed in")
+        || lower.contains("sign in")
+}
+
+/// Runs `op` once and gives what it wrote.
+fn run_op(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    cancelled: &dyn Fn() -> bool,
+    deadline: Instant,
+) -> Result<String, OpFailure> {
+    let refused = |message: &str| OpFailure::Refused(CredError(message.into()));
+    let waited = wait_child(command, input, cancelled, deadline)
+        .map_err(|e| OpFailure::Refused(CredError(format!("1Password-CLI start niet: {e}"))))?;
+    let output = match waited {
+        Waited::Exited(output) => output,
+        Waited::Cancelled => return Err(refused("Inloggen gestopt")),
+        Waited::TimedOut => {
+            return Err(refused(
+                "1Password gaf binnen 2 minuten geen antwoord. Ontgrendel 1Password en probeer opnieuw.",
+            ));
+        }
+    };
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(if about_1password(&detail) {
+            OpFailure::Refused(CredError(op_message(&detail, "")))
+        } else {
+            OpFailure::Item(detail)
+        });
+    }
+    String::from_utf8(output.stdout).map_err(|_| refused("1Password gaf geen leesbare tekst"))
 }
 
 /// What Touch ID and Windows Hello show: "EB MCP wil het wachtwoord van Studio Noord gebruiken".
@@ -114,41 +318,63 @@ fn split_injected(output: &str) -> Option<(String, String)> {
     ))
 }
 
-fn read_1password(reference: &str, cancel: &AtomicBool) -> Result<Credentials, CredError> {
-    let op = op_binary().ok_or_else(|| CredError("De 1Password-CLI (op) is niet gevonden. Installeer hem en zet de koppeling met de 1Password-app aan.".into()))?;
-    // One deadline for the whole read: the user answers 1Password's prompt once.
-    let deadline = Instant::now() + OP_TIMEOUT;
+/// The template `op inject` fills in for several items at once: a line of its own between and around them,
+/// then per item its username on one line and its password on the next.
+fn batch_template(references: &[&str], boundary: &str) -> String {
+    let mut template = String::from(boundary);
+    for reference in references {
+        template.push_str(&format!(
+            "\n{{{{ {reference}/username }}}}\n{{{{ {reference}/password }}}}\n{boundary}"
+        ));
+    }
+    template
+}
+
+/// The username and password of each of `count` items out of what `op inject` wrote for `batch_template`.
+fn split_batch(output: &str, boundary: &str, count: usize) -> Option<Vec<(String, String)>> {
+    let mut parts = output.split(boundary);
+    // Before the first boundary there is nothing.
+    parts.next()?;
+    let found: Vec<(String, String)> = parts
+        .take(count)
+        .map(|part| {
+            let part = part
+                .strip_prefix("\r\n")
+                .or_else(|| part.strip_prefix('\n'))?;
+            split_injected(part)
+        })
+        .collect::<Option<_>>()?;
+    (found.len() == count).then_some(found)
+}
+
+/// One item on its own: through `op inject` when its reference can stand in a template, field by field
+/// when it cannot.
+fn read_one(
+    op: &std::path::Path,
+    reference: &str,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> Result<Credentials, CredError> {
+    let cancelled = || cancel.load(Ordering::SeqCst);
     let run = |command: &mut Command, input: Option<&[u8]>| -> Result<String, CredError> {
-        let waited = wait_child(command, input, cancel, deadline)
-            .map_err(|e| CredError(format!("1Password-CLI start niet: {e}")))?;
-        let output = match waited {
-            Waited::Exited(output) => output,
-            Waited::Cancelled => return Err(CredError("Inloggen gestopt".into())),
-            Waited::TimedOut => {
-                return Err(CredError(
-                    "1Password gaf binnen 2 minuten geen antwoord. Ontgrendel 1Password en probeer opnieuw."
-                        .into(),
-                ));
-            }
-        };
-        if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr);
-            return Err(CredError(op_message(&detail, reference)));
-        }
-        String::from_utf8(output.stdout)
-            .map_err(|_| CredError("1Password gaf geen leesbare tekst".into()))
+        run_op(command, input, &cancelled, deadline).map_err(|failure| match failure {
+            OpFailure::Refused(error) => error,
+            OpFailure::Item(stderr) => CredError(op_message(&stderr, reference)),
+        })
     };
-    // Each start of `op` takes over a second, most of it talking to the 1Password app. `op inject` fills in
-    // both fields in one start; a reference it cannot take in a template is read field by field.
     let (username, password) = if plain_reference(reference) {
-        let template = format!("{{{{ {reference}/username }}}}\n{{{{ {reference}/password }}}}");
-        let output = run(Command::new(&op).arg("inject"), Some(template.as_bytes()))?;
-        split_injected(&output)
+        let boundary = format!("--eb-mcp-{}--", Uuid::new_v4().simple());
+        let output = run(
+            Command::new(op).arg("inject"),
+            Some(batch_template(&[reference], &boundary).as_bytes()),
+        )?;
+        split_batch(&output, &boundary, 1)
+            .and_then(|mut found| found.pop())
             .ok_or_else(|| CredError("1Password gaf geen leesbare tekst".into()))?
     } else {
         let field = |name: &str| {
             run(
-                Command::new(&op).args(["read", "--no-newline", &format!("{reference}/{name}")]),
+                Command::new(op).args(["read", "--no-newline", &format!("{reference}/{name}")]),
                 None,
             )
         };
@@ -172,13 +398,13 @@ enum Waited {
     TimedOut,
 }
 
-/// Runs `command` to its end, unless `cancel` is set or `deadline` passes first: then the child is killed.
+/// Runs `command` to its end, unless `cancelled` says so or `deadline` passes first: then the child is killed.
 /// `input` is written to its standard input, which is then closed. Its output is read on threads meanwhile,
 /// so a full pipe never holds the child up.
 fn wait_child(
     command: &mut Command,
     input: Option<&[u8]>,
-    cancel: &AtomicBool,
+    cancelled: &dyn Fn() -> bool,
     deadline: Instant,
 ) -> std::io::Result<Waited> {
     let mut child = command
@@ -208,7 +434,7 @@ fn wait_child(
                     stderr: stderr.join().unwrap_or_default(),
                 }));
             }
-            Ok(None) if cancel.load(Ordering::SeqCst) => Ok(Waited::Cancelled),
+            Ok(None) if cancelled() => Ok(Waited::Cancelled),
             Ok(None) if Instant::now() >= deadline => Ok(Waited::TimedOut),
             Ok(None) => {
                 std::thread::sleep(OP_POLL);
@@ -499,7 +725,8 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::{
-        OpListError, confirm_text, list_error, op_message, parse_items, plain_reference,
+        Credentials, OpListError, OpReader, OpRequest, about_1password, batch_template,
+        confirm_text, list_error, op_message, parse_items, plain_reference, split_batch,
         split_injected,
     };
 
@@ -584,7 +811,7 @@ mod tests {
             let waited = wait_child(
                 Command::new("sleep").arg("30"),
                 None,
-                &never,
+                &|| never.load(Ordering::SeqCst),
                 Instant::now() + Duration::from_millis(300),
             )
             .unwrap();
@@ -601,7 +828,7 @@ mod tests {
             let waited = wait_child(
                 Command::new("sleep").arg("30"),
                 None,
-                &cancel,
+                &|| cancel.load(Ordering::SeqCst),
                 Instant::now() + Duration::from_secs(60),
             )
             .unwrap();
@@ -615,7 +842,7 @@ mod tests {
             let waited = wait_child(
                 Command::new("sh").args(["-c", "printf hallo; printf oeps >&2; exit 3"]),
                 None,
-                &never,
+                &|| never.load(Ordering::SeqCst),
                 Instant::now() + Duration::from_secs(30),
             )
             .unwrap();
@@ -629,7 +856,7 @@ mod tests {
                 wait_child(
                     &mut Command::new("/nonexistent/op"),
                     None,
-                    &never,
+                    &|| never.load(Ordering::SeqCst),
                     Instant::now() + Duration::from_secs(1)
                 )
                 .is_err()
@@ -638,7 +865,7 @@ mod tests {
             let Waited::Exited(output) = wait_child(
                 &mut Command::new("cat"),
                 Some(b"een\ntwee"),
-                &never,
+                &|| never.load(Ordering::SeqCst),
                 Instant::now() + Duration::from_secs(30),
             )
             .unwrap() else {
@@ -670,6 +897,91 @@ mod tests {
             Some(("jan".into(), "geheim".into()))
         );
         assert_eq!(split_injected("alleen een regel"), None);
+    }
+
+    #[test]
+    fn one_template_asks_for_several_items_and_its_answer_is_split_per_item() {
+        let template = batch_template(&["op://v1/i1", "op://v2/i2"], "--B--");
+        assert_eq!(
+            template,
+            "--B--\n{{ op://v1/i1/username }}\n{{ op://v1/i1/password }}\n--B--\n{{ op://v2/i2/username }}\n{{ op://v2/i2/password }}\n--B--"
+        );
+        // What `op inject` writes for it: the same text with the references filled in.
+        let output = "--B--\njan@studionoord.example\ngeheim\n--B--\nlisa\nw8 woord \n--B--\n";
+        assert_eq!(
+            split_batch(output, "--B--", 2),
+            Some(vec![
+                ("jan@studionoord.example".into(), "geheim".into()),
+                ("lisa".into(), "w8 woord ".into())
+            ])
+        );
+        assert_eq!(
+            split_batch("--B--\r\njan\r\ngeheim\r\n--B--", "--B--", 1),
+            Some(vec![("jan".into(), "geheim".into())])
+        );
+        // Fewer items than asked for, or no boundary at all: nothing is guessed.
+        assert_eq!(split_batch(output, "--B--", 3), None);
+        assert_eq!(split_batch("iets anders", "--B--", 1), None);
+        // An empty field stays empty, for the caller to refuse.
+        assert_eq!(
+            split_batch("--B--\njan\n\n--B--", "--B--", 1),
+            Some(vec![("jan".into(), String::new())])
+        );
+        assert!(about_1password("[ERROR] authorization prompt dismissed"));
+        assert!(!about_1password(
+            "[ERROR] \"EB\" isn't an item in the \"Werk\" vault"
+        ));
+    }
+
+    /// Sign-ins that start together are read in one go; one that comes while a read runs waits for the next.
+    #[tokio::test]
+    async fn sign_ins_that_start_together_share_one_read() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        static SIZES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        static STARTS: AtomicUsize = AtomicUsize::new(0);
+        fn fake(batch: Vec<OpRequest>) {
+            STARTS.fetch_add(1, Ordering::SeqCst);
+            SIZES.lock().unwrap().push(batch.len());
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let count = batch.len();
+            for request in batch {
+                let answer = if request.cancel.load(Ordering::SeqCst) {
+                    Err(super::CredError("Inloggen gestopt".into()))
+                } else {
+                    Ok((
+                        Credentials {
+                            username: request.reference.clone(),
+                            password: "geheim".into(),
+                        },
+                        count,
+                    ))
+                };
+                let _ = request.answer.send(answer);
+            }
+        }
+        let reader = Arc::new(OpReader::default());
+        let go = Arc::new(AtomicBool::new(false));
+        let read = |reference: &str| {
+            let (reader, go, reference) = (reader.clone(), go.clone(), reference.to_owned());
+            tokio::spawn(async move { reader.read_through(reference, &go, fake).await })
+        };
+        let first: Vec<_> = ["op://v/a", "op://v/b", "op://v/c"]
+            .into_iter()
+            .map(read)
+            .collect();
+        // While that read runs, two more come in: they wait and go together in the next one.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let later: Vec<_> = ["op://v/d", "op://v/e"].into_iter().map(read).collect();
+        for (task, reference) in first.into_iter().zip(["op://v/a", "op://v/b", "op://v/c"]) {
+            let (credentials, together) = task.await.unwrap().unwrap();
+            assert_eq!((credentials.username.as_str(), together), (reference, 3));
+        }
+        for task in later {
+            assert_eq!(task.await.unwrap().unwrap().1, 2);
+        }
+        assert_eq!(*SIZES.lock().unwrap(), [3, 2]);
+        assert_eq!(STARTS.load(Ordering::SeqCst), 2);
     }
 
     #[test]

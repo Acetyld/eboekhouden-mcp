@@ -561,24 +561,36 @@ impl EbClient {
     /// session cookies and the hidden `txtFormCheck`, then post the form. e-Boekhouden answers with the
     /// `auth-token` cookie its API reads. `device` stands in for the page's browser fingerprint (`FP`).
     /// The password goes only into the form's body. `notes` tell the diagnosis what came back, without values.
+    #[cfg(test)]
     pub async fn login(&self, username: &str, password: &str, device: u32) -> LoginRun {
+        let page = self.login_page().await;
+        self.login_submit(page, username, password, device).await
+    }
+
+    /// The first half of a sign-in: the login page with its session cookies and hidden `txtFormCheck`. It
+    /// needs no credentials, so a sign-in fetches it while 1Password or the Keychain is still being read.
+    pub async fn login_page(&self) -> LoginPage {
         let mut run = LoginRun {
             calls: Vec::new(),
             notes: Vec::new(),
             outcome: Login::Error(String::new()),
         };
+        let fetched = Instant::now();
         let page_url = self.classic.join("inloggen.asp").expect("login page URL");
         let (call, page) = self.classic_call("GET", page_url.clone(), None, &[]).await;
         run.calls.push(call.clone());
         let Some(page) = page else {
             run.outcome = Login::Error(call.error.unwrap_or_default());
-            return run;
+            return LoginPage {
+                run,
+                form: None,
+                fetched,
+            };
         };
-        let mut cookies = page.cookies.clone();
         run.notes.push(format!(
             "Inlogpagina: status {}, cookies gezet: {}",
             call.status,
-            cookie_names(&cookies)
+            cookie_names(&page.cookies)
         ));
         let Some(form_check) = input_value(&page.body, "txtFormCheck") else {
             let message = format!(
@@ -587,6 +599,41 @@ impl EbClient {
             );
             run.calls.last_mut().expect("page call").error = Some(message.clone());
             run.outcome = Login::Error(message);
+            return LoginPage {
+                run,
+                form: None,
+                fetched,
+            };
+        };
+        LoginPage {
+            run,
+            form: Some(LoginForm {
+                url: page_url,
+                body: page.body,
+                cookies: page.cookies,
+                form_check,
+            }),
+            fetched,
+        }
+    }
+
+    /// The second half: posts the form of `page` with the username and password. A page that could not be
+    /// fetched or read ends the sign-in here with what `login_page` found.
+    pub async fn login_submit(
+        &self,
+        page: LoginPage,
+        username: &str,
+        password: &str,
+        device: u32,
+    ) -> LoginRun {
+        let mut run = page.run;
+        let Some(LoginForm {
+            url: page_url,
+            body: page_body,
+            mut cookies,
+            form_check,
+        }) = page.form
+        else {
             return run;
         };
         let server = cookies
@@ -638,9 +685,9 @@ impl EbClient {
             cookies.retain(|c| c.name != cookie.name);
             cookies.push(cookie);
         }
-        run.outcome = classic_outcome(call.status, &answer.body, &page.body, &cookies);
+        run.outcome = classic_outcome(call.status, &answer.body, &page_body, &cookies);
         if !matches!(run.outcome, Login::Session(_)) {
-            let new = new_on_page(&answer.body, &page.body, username);
+            let new = new_on_page(&answer.body, &page_body, username);
             if !new.is_empty() {
                 run.notes
                     .push(format!("Nieuw op de pagina: {}", new.join(" | ")));
@@ -882,6 +929,33 @@ pub struct LoginRun {
     pub calls: Vec<ApiCall>,
     pub notes: Vec<String>,
     pub outcome: Login,
+}
+
+/// The login page as `login_page` fetched it, for `login_submit`.
+pub struct LoginPage {
+    run: LoginRun,
+    /// `None` when the page could not be fetched or has no form to post; `run` says why.
+    form: Option<LoginForm>,
+    fetched: Instant,
+}
+
+impl LoginPage {
+    /// How long ago the page was fetched: a sign-in that waited long for its credentials fetches a new one.
+    pub fn age(&self) -> Duration {
+        self.fetched.elapsed()
+    }
+
+    /// The calls made for a page that is thrown away, so they still reach the request log.
+    pub fn into_calls(self) -> Vec<ApiCall> {
+        self.run.calls
+    }
+}
+
+struct LoginForm {
+    url: Url,
+    body: String,
+    cookies: Vec<SetCookie>,
+    form_check: String,
 }
 
 /// A cookie from a `Set-Cookie` header. `shared` when it names a domain: the browser then sends it to
